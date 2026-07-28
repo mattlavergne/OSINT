@@ -77,9 +77,9 @@ Every source below is free and **needs no API key**.
 Three keys unlock extra panels. All are optional; nothing breaks without them.
 
 ```sh
-wrangler pages secret put SHODAN_API_KEY       # deeper host detail
-wrangler pages secret put VIRUSTOTAL_API_KEY   # vendor reputation for domains and IPs
-wrangler pages secret put ABUSEIPDB_API_KEY    # abuse confidence score for IPs
+npx wrangler secret put SHODAN_API_KEY       # deeper host detail
+npx wrangler secret put VIRUSTOTAL_API_KEY   # vendor reputation for domains and IPs
+npx wrangler secret put ABUSEIPDB_API_KEY    # abuse confidence score for IPs
 ```
 
 For the Node server, set them as environment variables instead. See `.dev.vars.example`.
@@ -91,14 +91,14 @@ For the Node server, set them as environment variables instead. See `.dev.vars.e
 ```sh
 npm install
 npm run build      # generates public/data/phone/ from the libphonenumber datasets
-npm test           # 29 offline tests
+npm test           # 38 offline tests
 npm run test:live  # adds live upstream integration tests
 ```
 
 Then either runtime:
 
 ```sh
-npm run dev        # Cloudflare Pages + Functions, via wrangler
+npm run dev        # Cloudflare Worker, via wrangler
 npm run dev:node   # plain Node server on http://127.0.0.1:8787
 ```
 
@@ -110,57 +110,60 @@ npm run dev:node   # plain Node server on http://127.0.0.1:8787
 
 Everything below runs on the **Cloudflare free plan**. No paid features are involved.
 
-The zone already has a Worker, `trafficmap-proxy`, on `mattlavergne.com/*` and `*.mattlavergne.com/*`. That catch-all is what currently answers `/OSINT` with the mattOS shell. Pages custom domains attach to a *hostname*, never to a path, so serving this app at `/OSINT` means adding a second Worker on a **more specific route** — Cloudflare resolves overlapping routes by specificity, so `mattlavergne.com/OSINT*` wins for that path and `trafficmap-proxy` keeps serving everything else, unmodified.
+The app deploys as a **single Worker** that serves the frontend from static assets *and* runs the API. There is no Pages project and no proxy Worker — one deploy, one moving part.
 
-### Step 1 — deploy the app as a Pages project
+The zone already has `trafficmap-proxy` on `mattlavergne.com/*`, which is why every path currently returns the mattOS shell. Cloudflare resolves overlapping Worker routes by specificity, so `mattlavergne.com/OSINT*` wins for that path while `trafficmap-proxy` keeps serving everything else, unmodified.
 
-In the Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to Git**, and pick this repo.
+### Option A — dashboard (Workers Builds)
 
-| Setting | Value |
+**Workers & Pages → Create → Workers → Import a repository**, and pick this repo.
+
+| Field | Value |
 |---|---|
-| Project name | `ghosttrace` |
-| Production branch | your default branch |
+| Worker name | `osint` |
 | Build command | `npm run build` |
-| Build output directory | `public` |
+| Deploy command | `npx wrangler deploy` |
+| Path | `/` (the project is at the repo root) |
 
-The build command is required — the ~8 MB of phone reference data is generated, not committed.
+The build command is required — the ~8 MB of phone reference data under `public/data/phone/` is generated, not committed.
 
-This gives you a working app at `https://ghosttrace.pages.dev`. Test it there before touching the domain.
+`wrangler.toml` already carries the route, so the Worker attaches to `mattlavergne.com/OSINT*` on first deploy. Nothing to configure by hand.
 
-### Step 2 — put it on the `/OSINT` path
-
-```sh
-npx wrangler deploy --config deploy/wrangler.proxy.toml
-```
-
-That deploys `deploy/osint-proxy-worker.js` as a Worker named `osint-proxy` and binds it to `mattlavergne.com/OSINT*`. It strips the `/OSINT` prefix and proxies to the Pages deployment, and redirects bare `/OSINT` to `/OSINT/` so the app's relative URLs resolve.
-
-If your Pages project is not named `ghosttrace`, change `UPSTREAM` at the top of `deploy/osint-proxy-worker.js` first.
-
-To do the same through the dashboard instead: **Workers & Pages → Create → Worker**, paste in `deploy/osint-proxy-worker.js`, deploy, then **Settings → Domains & Routes → Add route** with pattern `mattlavergne.com/OSINT*` and zone `mattlavergne.com`.
-
-### Step 3 — confirm
+### Option B — CLI
 
 ```sh
-curl -sI  https://mattlavergne.com/OSINT          # 301 → /OSINT/
-curl -sS  https://mattlavergne.com/OSINT/api/health
+npm install
+npm run deploy      # builds the reference data, then `wrangler deploy`
 ```
+
+### Verify
+
+```sh
+curl -sI https://mattlavergne.com/OSINT           # 301 -> /OSINT/
+curl -sS https://mattlavergne.com/OSINT/api/health
+```
+
+### How the mount works
+
+The Worker is bound to a path, not a hostname, so requests arrive with `/OSINT` still attached. `src/worker.js` strips it before dispatch, which keeps routing identical to a root-mounted deployment, and redirects bare `/OSINT` to `/OSINT/` — without that trailing slash the browser resolves the app's relative asset and API URLs against the site root and nothing loads.
+
+The strip is conditional, so the same build also works unprefixed on a `*.workers.dev` subdomain if you want to test before attaching the route. To mount somewhere else, change `PREFIX` in `src/worker.js` and the route in `wrangler.toml`; set `PREFIX` to `''` for a root-mounted deploy.
 
 ### Free-plan limits worth knowing
 
 | Limit | Free plan | What this app uses |
 |---|---|---|
-| Worker/Function requests | 100,000/day, shared across all Workers on the account | 1 proxy hop + 1 Function call per lookup; static assets add a proxy hop each |
+| Worker requests | 100,000/day | one per lookup, plus one per static asset |
 | Subrequests per request | 50 | measured 4 (IP), 25 (domain, worst case), 0 (phone) |
 | CPU time per request | 10 ms | lookups are I/O-bound, not CPU-bound |
-| Pages builds | 500/month | one per push |
-| Static asset requests | unlimited | — |
+| Static asset requests | free, not billed as requests | — |
+| Worker bundle size | 3 MB compressed | code only; the ~8 MB of phone data is assets, not bundle |
 
-The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 25, and redirects plus DoH fallbacks can push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
+The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 25, and redirect hops plus DoH fallbacks push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
 
 ### Alternative: a subdomain instead of a path
 
-If you would rather skip the proxy Worker entirely, add `osint.mattlavergne.com` as a **Custom domain** on the Pages project. Cloudflare creates the DNS record and certificate automatically, and no Worker is involved — one less hop, one less thing to break. The trade-off is only the URL.
+If you would rather not share the apex with the existing Worker, delete the `routes` block in `wrangler.toml`, deploy, and add `osint.mattlavergne.com` as a **Custom Domain** on the Worker. Cloudflare creates the DNS record and certificate. Then set `PREFIX = ''` in `src/worker.js`, since there is no longer a path prefix to strip.
 
 ### Alternative: Node behind nginx
 
@@ -170,9 +173,7 @@ If you move off Cloudflare later:
 BASE_PATH=/OSINT PORT=8787 node server/index.mjs
 ```
 
-Then include `deploy/nginx.conf` in the `server { }` block for the site. `BASE_PATH` strips the mount prefix, so routing is identical in both runtimes.
-
----
+Then include `deploy/nginx.conf` in the `server { }` block for the site. `BASE_PATH` strips the mount prefix, so routing is identical across all three runtimes.
 
 ## API
 
@@ -207,7 +208,7 @@ Status codes: `400` for invalid input (with a message written for a human), `404
 src/router.js            Runtime-agnostic router: Request in, Response out
 src/lookups/{ip,domain,phone}.js
 src/lib/{http,dns,rdap,validate}.js
-functions/api/[[route]].js   Cloudflare Pages adapter
+src/worker.js                Cloudflare Worker: static assets + API, mount-prefix aware
 server/index.mjs             Node adapter (static files + API)
 scripts/build-phone-data.mjs BSON → static JSON shards
 public/                      Frontend: no framework, no build step

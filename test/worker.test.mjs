@@ -1,63 +1,75 @@
 /**
- * Path-rewriting tests for the /OSINT proxy Worker.
+ * Mount-prefix tests for the Worker entry point.
  *
- * The prefix maths is the whole job of that Worker, and getting it subtly wrong
- * (a lost trailing slash, a dropped query string) breaks the app in ways that
- * only show up in production. Cheap to pin down here.
+ * The Worker is bound to `mattlavergne.com/OSINT*`, so every request arrives
+ * with the prefix attached and must be stripped before dispatch. Getting this
+ * subtly wrong — a lost trailing slash, a dropped query string, an API call
+ * mistaken for an asset — breaks the app only in production. Cheap to pin here.
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { rewrite } from '../deploy/osint-proxy-worker.js';
+import { resolvePath } from '../src/worker.js';
 
-const UPSTREAM = 'https://ghosttrace.pages.dev';
+const at = (path) => `https://mattlavergne.com${path}`;
 
-describe('OSINT proxy Worker', () => {
+describe('Worker mount prefix', () => {
   test('redirects bare /OSINT to /OSINT/', () => {
     // Without the trailing slash the browser resolves the app's relative asset
     // and API URLs against the site root, and nothing loads.
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT'), {
-      redirect: 'https://mattlavergne.com/OSINT/',
-    });
+    assert.deepEqual(resolvePath(at('/OSINT')), { redirect: at('/OSINT/') });
   });
 
   test('preserves the query string across that redirect', () => {
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT?type=ip&q=8.8.8.8'), {
-      redirect: 'https://mattlavergne.com/OSINT/?type=ip&q=8.8.8.8',
+    assert.deepEqual(resolvePath(at('/OSINT?type=ip&q=8.8.8.8')), {
+      redirect: at('/OSINT/?type=ip&q=8.8.8.8'),
     });
   });
 
   test('maps the app root', () => {
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/'), { upstream: `${UPSTREAM}/` });
+    assert.deepEqual(resolvePath(at('/OSINT/')), { path: '/', isApi: false });
   });
 
   test('maps static assets', () => {
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/assets/app.css'),
-      { upstream: `${UPSTREAM}/assets/app.css` });
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/data/phone/geo/44.json'),
-      { upstream: `${UPSTREAM}/data/phone/geo/44.json` });
+    assert.deepEqual(resolvePath(at('/OSINT/assets/app.css')),
+      { path: '/assets/app.css', isApi: false });
+    assert.deepEqual(resolvePath(at('/OSINT/data/phone/geo/44.json')),
+      { path: '/data/phone/geo/44.json', isApi: false });
   });
 
-  test('maps API calls with their query strings intact', () => {
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/api/domain?q=github.com'),
-      { upstream: `${UPSTREAM}/api/domain?q=github.com` });
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/api/phone?q=%2B33612345678&region=FR'),
-      { upstream: `${UPSTREAM}/api/phone?q=%2B33612345678&region=FR` });
+  test('recognises API calls under the prefix', () => {
+    assert.deepEqual(resolvePath(at('/OSINT/api/domain?q=github.com')),
+      { path: '/api/domain', isApi: true });
+    assert.deepEqual(resolvePath(at('/OSINT/api/health')),
+      { path: '/api/health', isApi: true });
   });
 
-  test('refuses paths that only look like the prefix', () => {
-    // The route pattern /OSINT* matches these too; they are not the app.
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINTfoo'), { notFound: true });
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT-backup/secret'), { notFound: true });
+  test('does not treat a lookalike asset path as API', () => {
+    assert.equal(resolvePath(at('/OSINT/assets/api.js')).isApi, false);
+    assert.equal(resolvePath(at('/OSINT/apitest')).isApi, false);
   });
 
-  test('cannot be walked out of the prefix', () => {
-    // `new URL()` resolves the dot segments before the prefix test runs, so a
-    // traversal attempt lands outside /OSINT/ and is refused rather than
-    // rewritten. Either outcome is safe; this pins which one happens.
-    // The URL parser also decodes %2e before normalising, so the encoded form
-    // is neutralised identically.
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/../../etc/passwd'), { notFound: true });
-    assert.deepEqual(rewrite('https://mattlavergne.com/OSINT/%2e%2e/%2e%2e/admin'), { notFound: true });
+  test('works unprefixed, so a workers.dev deployment behaves the same', () => {
+    // Same build, no /OSINT in the path — used for testing before the route
+    // is attached to the domain.
+    assert.deepEqual(resolvePath('https://osint.workers.dev/api/health'),
+      { path: '/api/health', isApi: true });
+    assert.deepEqual(resolvePath('https://osint.workers.dev/'),
+      { path: '/', isApi: false });
+  });
+
+  test('leaves paths that merely start with the prefix string alone', () => {
+    // /OSINTfoo is not inside the mount, so the prefix must not be stripped.
+    assert.deepEqual(resolvePath(at('/OSINTfoo')), { path: '/OSINTfoo', isApi: false });
+  });
+
+  test('cannot be walked out of the mount', () => {
+    // `new URL()` resolves dot segments before the prefix test runs, in both
+    // plain and percent-encoded form, so traversal lands outside the mount and
+    // is served as an ordinary (missing) asset rather than escaping anywhere.
+    assert.deepEqual(resolvePath(at('/OSINT/../../etc/passwd')),
+      { path: '/etc/passwd', isApi: false });
+    assert.deepEqual(resolvePath(at('/OSINT/%2e%2e/admin')),
+      { path: '/admin', isApi: false });
   });
 });

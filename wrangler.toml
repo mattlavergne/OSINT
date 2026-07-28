@@ -1,13 +1,34 @@
-name = "ghosttrace"
-pages_build_output_dir = "public"
+# GhostTrace — single Worker serving both the static frontend and the API.
+#
+# Deploy:  npx wrangler deploy
+# Local:   npx wrangler dev
+#
+# Run `npm run build` first (or let the dashboard's build command do it) —
+# public/data/phone/ is generated, not committed.
+
+name = "osint"
+main = "src/worker.js"
 compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Optional enrichment keys. Set them with:
-#   wrangler pages secret put SHODAN_API_KEY
-#   wrangler pages secret put VIRUSTOTAL_API_KEY
-#   wrangler pages secret put ABUSEIPDB_API_KEY
-# Everything works without them; keyed panels simply stay hidden.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# The Worker must see every request so it can strip the /OSINT mount prefix
+# before looking anything up. Without this, Cloudflare would try to match the
+# prefixed path against the asset manifest and miss.
+run_worker_first = true
 
-[vars]
-GHOSTTRACE_ENV = "production"
+# Mounts the app at https://mattlavergne.com/OSINT.
+#
+# The zone already has `trafficmap-proxy` on `mattlavergne.com/*`. Cloudflare
+# resolves overlapping routes by specificity, so this more specific pattern
+# wins for /OSINT while the existing Worker keeps serving everything else.
+routes = [
+  { pattern = "mattlavergne.com/OSINT*", zone_name = "mattlavergne.com" }
+]
+
+# Optional enrichment keys — the app is fully functional without them:
+#   npx wrangler secret put SHODAN_API_KEY
+#   npx wrangler secret put VIRUSTOTAL_API_KEY
+#   npx wrangler secret put ABUSEIPDB_API_KEY
