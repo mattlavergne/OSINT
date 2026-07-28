@@ -108,24 +108,69 @@ npm run dev:node   # plain Node server on http://127.0.0.1:8787
 
 ## Deploying to `mattlavergne.com/OSINT`
 
-### Cloudflare Pages (recommended — the site is already behind Cloudflare)
+Everything below runs on the **Cloudflare free plan**. No paid features are involved.
 
-1. Create a Pages project from this repo.
-   - **Build command:** `npm run build`
-   - **Output directory:** `public`
-2. Deploy, then add a route so the app answers under the `/OSINT` path of the apex domain. Either:
-   - a **Custom domain** of `mattlavergne.com` with a Pages path rule, or
-   - a **Worker route** / Bulk Redirect pointing `mattlavergne.com/OSINT*` at the Pages deployment.
+The zone already has a Worker, `trafficmap-proxy`, on `mattlavergne.com/*` and `*.mattlavergne.com/*`. That catch-all is what currently answers `/OSINT` with the mattOS shell. Pages custom domains attach to a *hostname*, never to a path, so serving this app at `/OSINT` means adding a second Worker on a **more specific route** — Cloudflare resolves overlapping routes by specificity, so `mattlavergne.com/OSINT*` wins for that path and `trafficmap-proxy` keeps serving everything else, unmodified.
 
-The frontend derives its API base from wherever `index.html` was served, so it works at the site root, at `/OSINT`, or at any other prefix with no configuration.
+### Step 1 — deploy the app as a Pages project
 
-### Node behind nginx
+In the Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to Git**, and pick this repo.
+
+| Setting | Value |
+|---|---|
+| Project name | `ghosttrace` |
+| Production branch | your default branch |
+| Build command | `npm run build` |
+| Build output directory | `public` |
+
+The build command is required — the ~8 MB of phone reference data is generated, not committed.
+
+This gives you a working app at `https://ghosttrace.pages.dev`. Test it there before touching the domain.
+
+### Step 2 — put it on the `/OSINT` path
+
+```sh
+npx wrangler deploy --config deploy/wrangler.proxy.toml
+```
+
+That deploys `deploy/osint-proxy-worker.js` as a Worker named `osint-proxy` and binds it to `mattlavergne.com/OSINT*`. It strips the `/OSINT` prefix and proxies to the Pages deployment, and redirects bare `/OSINT` to `/OSINT/` so the app's relative URLs resolve.
+
+If your Pages project is not named `ghosttrace`, change `UPSTREAM` at the top of `deploy/osint-proxy-worker.js` first.
+
+To do the same through the dashboard instead: **Workers & Pages → Create → Worker**, paste in `deploy/osint-proxy-worker.js`, deploy, then **Settings → Domains & Routes → Add route** with pattern `mattlavergne.com/OSINT*` and zone `mattlavergne.com`.
+
+### Step 3 — confirm
+
+```sh
+curl -sI  https://mattlavergne.com/OSINT          # 301 → /OSINT/
+curl -sS  https://mattlavergne.com/OSINT/api/health
+```
+
+### Free-plan limits worth knowing
+
+| Limit | Free plan | What this app uses |
+|---|---|---|
+| Worker/Function requests | 100,000/day, shared across all Workers on the account | 1 proxy hop + 1 Function call per lookup; static assets add a proxy hop each |
+| Subrequests per request | 50 | measured 4 (IP), 25 (domain, worst case), 0 (phone) |
+| CPU time per request | 10 ms | lookups are I/O-bound, not CPU-bound |
+| Pages builds | 500/month | one per push |
+| Static asset requests | unlimited | — |
+
+The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 25, and redirects plus DoH fallbacks can push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
+
+### Alternative: a subdomain instead of a path
+
+If you would rather skip the proxy Worker entirely, add `osint.mattlavergne.com` as a **Custom domain** on the Pages project. Cloudflare creates the DNS record and certificate automatically, and no Worker is involved — one less hop, one less thing to break. The trade-off is only the URL.
+
+### Alternative: Node behind nginx
+
+If you move off Cloudflare later:
 
 ```sh
 BASE_PATH=/OSINT PORT=8787 node server/index.mjs
 ```
 
-Then include `deploy/nginx.conf` in the `server { }` block for the site. `BASE_PATH` strips the mount prefix so routing is identical in both runtimes.
+Then include `deploy/nginx.conf` in the `server { }` block for the site. `BASE_PATH` strips the mount prefix, so routing is identical in both runtimes.
 
 ---
 

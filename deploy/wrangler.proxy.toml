@@ -1,0 +1,20 @@
+# Wrangler config for the /OSINT proxy Worker.
+#
+# This is a SEPARATE Worker from the GhostTrace Pages project. Deploy it from
+# this directory:
+#
+#   npx wrangler deploy --config deploy/wrangler.proxy.toml
+#
+# It does not replace `trafficmap-proxy` — it sits alongside it on a more
+# specific route, and Cloudflare gives the more specific route precedence.
+
+name = "osint-proxy"
+main = "osint-proxy-worker.js"
+compatibility_date = "2026-07-01"
+
+# More specific than the existing `mattlavergne.com/*` route, so this Worker
+# wins for /OSINT and everything under it, while the existing Worker keeps
+# serving the rest of the site untouched.
+routes = [
+  { pattern = "mattlavergne.com/OSINT*", zone_name = "mattlavergne.com" }
+]
