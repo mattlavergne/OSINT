@@ -19,12 +19,20 @@ binding = "ASSETS"
 # prefixed path against the asset manifest and miss.
 run_worker_first = true
 
-# Mounts the app at https://mattlavergne.com/OSINT.
+# Mounts the app at https://mattlavergne.com/osint.
 #
 # The zone already has `trafficmap-proxy` on `mattlavergne.com/*`. Cloudflare
-# resolves overlapping routes by specificity, so this more specific pattern
-# wins for /OSINT while the existing Worker keeps serving everything else.
+# resolves overlapping routes by specificity, so these more specific patterns
+# win for /osint while the existing Worker keeps serving everything else.
+#
+# The trailing `*` is load-bearing: without it the route matches only the bare
+# /osint URL, and every asset and API call underneath falls through to the
+# other Worker — the page renders with no stylesheet and no script.
+#
+# Both cases are listed because Cloudflare route paths are case-sensitive,
+# so /osint* and /OSINT* are genuinely different routes.
 routes = [
+  { pattern = "mattlavergne.com/osint*", zone_name = "mattlavergne.com" },
   { pattern = "mattlavergne.com/OSINT*", zone_name = "mattlavergne.com" }
 ]
 

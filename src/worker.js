@@ -14,8 +14,16 @@
 
 import { handleApiRequest } from './router.js';
 
-/** Path prefix this Worker is mounted under. Empty string means site root. */
-const PREFIX = '/OSINT';
+/**
+ * Path prefix this Worker is mounted under. Empty string means site root.
+ *
+ * Compared case-insensitively: the Cloudflare route pattern is case-sensitive,
+ * so `/osint*` and `/OSINT*` are two different routes, and it is easy to mount
+ * one and link the other. Matching loosely here means either spelling works
+ * whichever route is attached. Only the prefix is treated this way — the rest
+ * of the path stays byte-exact, since asset names are case-sensitive.
+ */
+const PREFIX = '/osint';
 
 /**
  * Security headers applied to everything the Worker serves.
@@ -45,17 +53,23 @@ const SECURITY_HEADERS = {
  */
 export function resolvePath(inbound) {
   const url = new URL(inbound);
+  const lower = url.pathname.toLowerCase();
 
-  // Bare /OSINT must become /OSINT/. The frontend derives its API base from
+  // Bare /osint must become /osint/. The frontend derives its API base from
   // document.baseURI; without the trailing slash the browser resolves
-  // "api/ip" against the site root and nothing loads.
-  if (PREFIX && url.pathname === PREFIX) {
-    return { redirect: `${url.origin}${PREFIX}/${url.search}` };
+  // "api/ip" and "assets/app.css" against the site root, which on this zone
+  // means the request falls through to whatever else serves the domain — you
+  // get an unstyled page rather than an error.
+  //
+  // The redirect keeps the spelling the visitor used, so it works no matter
+  // which case the route was attached with.
+  if (PREFIX && lower === PREFIX) {
+    return { redirect: `${url.origin}${url.pathname}/${url.search}` };
   }
 
   // Strip the mount prefix so downstream routing never has to know about it.
   // Conditional, so an unprefixed *.workers.dev deployment works identically.
-  const path = PREFIX && url.pathname.startsWith(`${PREFIX}/`)
+  const path = PREFIX && lower.startsWith(`${PREFIX}/`)
     ? url.pathname.slice(PREFIX.length)
     : url.pathname;
 
@@ -97,10 +111,20 @@ async function serveAsset(env, url, path) {
   const assetUrl = new URL(path === '/' ? '/index.html' : path, url.origin);
   const response = await env.ASSETS.fetch(new Request(assetUrl, { method: 'GET' }));
 
-  if (response.status === 404) {
-    return env.ASSETS.fetch(new Request(new URL('/index.html', url.origin)));
+  if (response.status !== 404) return response;
+
+  // Fall back to the app shell only for navigation-style paths. A request for
+  // a file — anything with an extension — must 404 honestly. Answering a
+  // missing stylesheet with HTML and a 200 is how a misconfigured mount shows
+  // up as "the CSS didn't load" instead of a clear error.
+  if (/\.[a-z0-9]+$/i.test(path)) {
+    return new Response(`Not found: ${path}`, {
+      status: 404,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
   }
-  return response;
+
+  return env.ASSETS.fetch(new Request(new URL('/index.html', url.origin)));
 }
 
 /** Phone reference data, fetched per calling code from the asset bundle. */

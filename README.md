@@ -106,13 +106,13 @@ npm run dev:node   # plain Node server on http://127.0.0.1:8787
 
 ---
 
-## Deploying to `mattlavergne.com/OSINT`
+## Deploying to `mattlavergne.com/osint`
 
 Everything below runs on the **Cloudflare free plan**. No paid features are involved.
 
 The app deploys as a **single Worker** that serves the frontend from static assets *and* runs the API. There is no Pages project and no proxy Worker — one deploy, one moving part.
 
-The zone already has `trafficmap-proxy` on `mattlavergne.com/*`, which is why every path currently returns the mattOS shell. Cloudflare resolves overlapping Worker routes by specificity, so `mattlavergne.com/OSINT*` wins for that path while `trafficmap-proxy` keeps serving everything else, unmodified.
+The zone already has `trafficmap-proxy` on `mattlavergne.com/*`, which is why every path currently returns the mattOS shell. Cloudflare resolves overlapping Worker routes by specificity, so `mattlavergne.com/osint*` wins for that path while `trafficmap-proxy` keeps serving everything else, unmodified.
 
 ### Option A — dashboard (Workers Builds)
 
@@ -127,7 +127,12 @@ The zone already has `trafficmap-proxy` on `mattlavergne.com/*`, which is why ev
 
 The build command is required — the ~8 MB of phone reference data under `public/data/phone/` is generated, not committed.
 
-`wrangler.toml` already carries the route, so the Worker attaches to `mattlavergne.com/OSINT*` on first deploy. Nothing to configure by hand.
+`wrangler.toml` already carries the routes, so the Worker attaches on first deploy. Nothing to configure by hand.
+
+Two details that are easy to get wrong if you add the route by hand instead:
+
+- **The trailing `*` is load-bearing.** `mattlavergne.com/osint` matches only that exact URL; every asset and API call underneath falls through to the other Worker, and the page renders with no stylesheet and no script.
+- **Route paths are case-sensitive.** `/osint*` and `/OSINT*` are different routes. `wrangler.toml` registers both, and the Worker matches its prefix case-insensitively, so either spelling works.
 
 ### Option B — CLI
 
@@ -139,13 +144,13 @@ npm run deploy      # builds the reference data, then `wrangler deploy`
 ### Verify
 
 ```sh
-curl -sI https://mattlavergne.com/OSINT           # 301 -> /OSINT/
-curl -sS https://mattlavergne.com/OSINT/api/health
+curl -sI https://mattlavergne.com/osint           # 301 -> /osint/
+curl -sS https://mattlavergne.com/osint/api/health
 ```
 
 ### How the mount works
 
-The Worker is bound to a path, not a hostname, so requests arrive with `/OSINT` still attached. `src/worker.js` strips it before dispatch, which keeps routing identical to a root-mounted deployment, and redirects bare `/OSINT` to `/OSINT/` — without that trailing slash the browser resolves the app's relative asset and API URLs against the site root and nothing loads.
+The Worker is bound to a path, not a hostname, so requests arrive with `/osint` still attached. `src/worker.js` strips it before dispatch, which keeps routing identical to a root-mounted deployment, and redirects bare `/osint` to `/osint/` — without that trailing slash the browser resolves the app's relative asset and API URLs against the site root and nothing loads.
 
 The strip is conditional, so the same build also works unprefixed on a `*.workers.dev` subdomain if you want to test before attaching the route. To mount somewhere else, change `PREFIX` in `src/worker.js` and the route in `wrangler.toml`; set `PREFIX` to `''` for a root-mounted deploy.
 
@@ -170,7 +175,7 @@ If you would rather not share the apex with the existing Worker, delete the `rou
 If you move off Cloudflare later:
 
 ```sh
-BASE_PATH=/OSINT PORT=8787 node server/index.mjs
+BASE_PATH=/osint PORT=8787 node server/index.mjs
 ```
 
 Then include `deploy/nginx.conf` in the `server { }` block for the site. `BASE_PATH` strips the mount prefix, so routing is identical across all three runtimes.
