@@ -8,7 +8,7 @@
  * infrastructure rather than a person (hosting/proxy signals).
  */
 
-import { getJson, gather } from '../lib/http.js';
+import { getJson, getText, gather } from '../lib/http.js';
 import { reverseLookup } from '../lib/dns.js';
 import { parseIp } from '../lib/validate.js';
 import * as rdap from '../lib/rdap.js';
@@ -33,6 +33,8 @@ export async function lookupIp(input, env = {}) {
     registry: () => registryInfo(ip.value),
     ptr: () => reverseLookup(ip.value, ip.version),
     exposure: () => shodanInternetDb(ip.value),
+    routing: () => routing(ip.value),
+    neighbours: () => reverseIp(ip.value),
     ...(env.ABUSEIPDB_API_KEY ? { abuse: () => abuseIpDb(ip.value, env.ABUSEIPDB_API_KEY) } : {}),
     ...(env.VIRUSTOTAL_API_KEY ? { reputation: () => virusTotalIp(ip.value, env.VIRUSTOTAL_API_KEY) } : {}),
   });
@@ -44,6 +46,8 @@ export async function lookupIp(input, env = {}) {
     geolocation: data.geo,
     registry: data.registry,
     reverseDns: data.ptr,
+    routing: data.routing,
+    hostedDomains: data.neighbours,
     exposure: data.exposure,
     abuse: data.abuse ?? null,
     reputation: data.reputation ?? null,
@@ -152,6 +156,64 @@ async function shodanInternetDb(ip) {
   }
 }
 
+/**
+ * BGP routing view from RIPEstat.
+ *
+ * Geolocation says where a database claims the address is; routing says who
+ * actually announces it to the internet, which is the harder fact to fake and
+ * the better basis for attribution.
+ */
+async function routing(ip) {
+  const body = await getJson(
+    `https://stat.ripe.net/data/prefix-overview/data.json?resource=${encodeURIComponent(ip)}`,
+    { source: 'stat.ripe.net', timeout: 10000 },
+  );
+
+  const d = body.data ?? {};
+  const asns = (d.asns ?? []).map((a) => ({ asn: `AS${a.asn}`, holder: a.holder ?? null }));
+
+  return {
+    announcedPrefix: d.resource ?? null,
+    announced: d.announced ?? null,
+    originAsns: asns,
+    // Registry-level block metadata, when RIPEstat has it.
+    blockDescription: d.block?.desc ?? null,
+    blockName: d.block?.name ?? null,
+    relatedPrefixes: (d.related_prefixes ?? []).slice(0, 8),
+  };
+}
+
+/**
+ * Other domains resolving to the same address.
+ *
+ * On dedicated hosting this names the operator directly. On shared hosting or
+ * behind a CDN it says only that the address is shared — which is itself worth
+ * knowing, because it means the address does not identify one owner.
+ */
+async function reverseIp(ip) {
+  const text = await getText(
+    `https://api.hackertarget.com/reverseiplookup/?q=${encodeURIComponent(ip)}`,
+    { source: 'hackertarget.com', timeout: 9000 },
+  );
+
+  if (/API count exceeded|error|no records/i.test(text)) {
+    if (/no records/i.test(text)) return { count: 0, domains: [], shared: false };
+    throw new Error('HackerTarget quota exceeded for this source address');
+  }
+
+  const domains = [...new Set(
+    text.split('\n').map((line) => line.trim().toLowerCase()).filter((d) => d && d.includes('.')),
+  )];
+
+  return {
+    count: domains.length,
+    domains: domains.slice(0, 100),
+    truncated: domains.length > 100,
+    // Many unrelated names on one address means shared infrastructure.
+    shared: domains.length > 5,
+  };
+}
+
 async function abuseIpDb(ip, key) {
   const body = await getJson(
     `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(ip)}&maxAgeInDays=90`,
@@ -249,6 +311,29 @@ function assess(data) {
       level: 'danger',
       title: `Flagged by ${data.reputation.malicious} security vendor(s)`,
       detail: `${data.reputation.harmless} vendors rate it harmless.`,
+    });
+  }
+
+  if (data.neighbours?.shared) {
+    findings.push({
+      level: 'info',
+      title: `${data.neighbours.count} domains share this address`,
+      detail: 'Shared hosting or a CDN front. The address does not identify a single owner, and any one domain on it is weak evidence about the others.',
+    });
+  } else if (data.neighbours?.count === 1) {
+    findings.push({
+      level: 'info',
+      title: 'Single domain on this address',
+      detail: `Only ${data.neighbours.domains[0]} resolves here, which suggests dedicated hosting.`,
+    });
+  }
+
+  if (data.routing?.originAsns?.length) {
+    const origin = data.routing.originAsns[0];
+    findings.push({
+      level: 'info',
+      title: `Announced by ${origin.asn}${origin.holder ? ` — ${origin.holder}` : ''}`,
+      detail: `Routed as part of ${data.routing.announcedPrefix}. Who announces a prefix is harder to falsify than a geolocation record.`,
     });
   }
 

@@ -1,11 +1,19 @@
-# Copy to .dev.vars for local `wrangler pages dev`, or export as env vars for the Node server.
-# All three are OPTIONAL. GhostTrace is fully functional without any of them.
+# Copy to .dev.vars for local `wrangler dev`, or export as env vars for the Node server.
+# All of these are OPTIONAL. GhostTrace is fully functional without any of them —
+# every core source is free and keyless.
 
-# https://account.shodan.io/  -> unlocks banner/vuln detail beyond the free InternetDB
+# https://account.shodan.io/  -> banner/vuln detail beyond the free InternetDB
 SHODAN_API_KEY=
 
-# https://www.virustotal.com/gui/my-apikey  -> unlocks reputation scoring for domains and IPs
+# https://www.virustotal.com/gui/my-apikey  -> reputation scoring for domains and IPs
 VIRUSTOTAL_API_KEY=
 
-# https://www.abuseipdb.com/account/api  -> unlocks abuse confidence score for IPs
+# https://www.abuseipdb.com/account/api  -> abuse confidence score for IPs
 ABUSEIPDB_API_KEY=
+
+# https://console.twilio.com/  -> CNAM caller-ID name and post-portability carrier
+# for phone lookups. This is the ONLY source here that can return a subscriber or
+# business name, and it is billed per lookup (roughly $0.01). US coverage for
+# caller name; line-type intelligence is international.
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=

@@ -24,6 +24,8 @@ export async function lookupDomain(input, env = {}) {
     email: () => emailSecurity(domain.value),
     certificates: () => certificateTransparency(domain.value),
     headers: () => securityHeaders(domain.value),
+    securityTxt: () => securityTxt(domain.value),
+    archive: () => archiveHistory(domain.value),
     ...(env.VIRUSTOTAL_API_KEY
       ? { reputation: () => virusTotalDomain(domain.value, env.VIRUSTOTAL_API_KEY) }
       : {}),
@@ -46,6 +48,10 @@ export async function lookupDomain(input, env = {}) {
     certificates: data.certificates,
     subdomains: data.certificates?.subdomains ?? [],
     httpHeaders: data.headers,
+    page: data.headers?.page ?? null,
+    securityTxt: data.securityTxt ?? null,
+    archive: data.archive ?? null,
+    identity: identity(data),
     reputation: data.reputation ?? null,
     assessment: assess(domain.value, data, hosts),
     pivots: pivots(domain.value),
@@ -298,7 +304,15 @@ function shortIssuer(issuerName = '') {
   return issuerName?.match(/O\s*=\s*"?([^,"]+)/)?.[1]?.trim() ?? String(issuerName).slice(0, 60);
 }
 
-/** One plain HTTPS GET to read the domain's security header posture. */
+/**
+ * One plain HTTPS GET of the site root, read twice over: for the security
+ * header posture, and for what the page itself discloses.
+ *
+ * The HTML is the single richest attribution source in a domain lookup — the
+ * organisation usually names itself in the title, og:site_name or copyright
+ * line, and the analytics IDs embedded in the page are a strong ownership
+ * pivot. All of it comes from a request we were already making.
+ */
 async function securityHeaders(domain) {
   const response = await request(`https://${domain}/`, {
     source: domain,
@@ -309,7 +323,15 @@ async function securityHeaders(domain) {
   const h = response.headers;
   const present = (name) => h.get(name) ?? null;
 
+  // Read a bounded slice: enough for <head> and the analytics snippets, without
+  // pulling a multi-megabyte page into a Worker.
+  let html = '';
+  if ((h.get('content-type') ?? '').includes('html')) {
+    html = await readCapped(response, 250_000);
+  }
+
   return {
+    page: html ? describePage(html) : null,
     status: response.status,
     finalUrl: response.url,
     server: present('server'),
@@ -323,6 +345,161 @@ async function securityHeaders(domain) {
     // A CDN in front changes what every other signal means, so name it.
     cdn: detectCdn(h),
     cookies: h.getSetCookie?.().length ?? (h.get('set-cookie') ? 1 : 0),
+  };
+}
+
+/** Read at most `limit` bytes of a response body, then stop. */
+async function readCapped(response, limit) {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+
+  const decoder = new TextDecoder();
+  let out = '';
+  try {
+    while (out.length < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out += decoder.decode(value, { stream: true });
+    }
+  } catch {
+    // A truncated read still gives us a usable <head>.
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return out.slice(0, limit);
+}
+
+/** Pull identity and ownership signals out of the page source. */
+function describePage(html) {
+  const head = html.slice(0, 120_000);
+
+  const meta = (attr, name) => {
+    const pattern = new RegExp(
+      `<meta[^>]+${attr}\\s*=\\s*["']${name}["'][^>]*content\\s*=\\s*["']([^"']{1,300})["']`,
+      'i',
+    );
+    const reversed = new RegExp(
+      `<meta[^>]+content\\s*=\\s*["']([^"']{1,300})["'][^>]*${attr}\\s*=\\s*["']${name}["']`,
+      'i',
+    );
+    return head.match(pattern)?.[1]?.trim() ?? head.match(reversed)?.[1]?.trim() ?? null;
+  };
+
+  const unique = (values) => [...new Set(values)];
+
+  // Analytics and tag IDs are among the strongest ownership pivots available:
+  // the same measurement ID across two sites is good evidence of a common
+  // operator. Searchable on publicwww / SpyOnWeb / Analyzeid.
+  const trackers = [
+    ...[...html.matchAll(/\b(G-[A-Z0-9]{6,12})\b/g)].map((m) => ({ type: 'Google Analytics 4', id: m[1] })),
+    ...[...html.matchAll(/\b(UA-\d{4,10}-\d{1,4})\b/g)].map((m) => ({ type: 'Google Analytics (legacy)', id: m[1] })),
+    ...[...html.matchAll(/\b(GTM-[A-Z0-9]{4,10})\b/g)].map((m) => ({ type: 'Google Tag Manager', id: m[1] })),
+    ...[...html.matchAll(/fbq\(\s*['"]init['"]\s*,\s*['"](\d{8,20})['"]/g)].map((m) => ({ type: 'Meta Pixel', id: m[1] })),
+    ...[...html.matchAll(/hjid\s*:\s*(\d{5,10})/g)].map((m) => ({ type: 'Hotjar', id: m[1] })),
+  ];
+
+  const seen = new Set();
+  const trackingIds = trackers.filter((t) => !seen.has(t.id) && seen.add(t.id)).slice(0, 12);
+
+  return {
+    title: head.match(/<title[^>]*>([\s\S]{1,300}?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() ?? null,
+    description: meta('name', 'description'),
+    siteName: meta('property', 'og:site_name') ?? meta('name', 'application-name'),
+    ogTitle: meta('property', 'og:title'),
+    author: meta('name', 'author'),
+    // `generator` names the CMS or site builder outright.
+    generator: meta('name', 'generator'),
+    themeColor: meta('name', 'theme-color'),
+    language: html.match(/<html[^>]+lang\s*=\s*["']([a-z-]{2,10})["']/i)?.[1] ?? null,
+    // A copyright line often carries the legal entity name.
+    copyright: unique(
+      [...html.matchAll(/(?:©|&copy;|Copyright)\s*(?:\d{4}(?:\s*[–—-]\s*\d{4})?)?\s*([A-Z][A-Za-z0-9.,'&\- ]{2,60}?)(?:\.|<|,\s*(?:All|Inc|LLC|Ltd))/g)]
+        .map((m) => m[1].trim())
+        .filter((v) => v.length > 2),
+    ).slice(0, 3),
+    // Contact addresses published on the page are legitimate public disclosure.
+    // Placeholder addresses from form markup and docs are noise, not contacts.
+    emails: unique(
+      [...html.matchAll(/\b([a-z0-9][\w.+-]{0,40}@[a-z0-9][\w.-]{0,60}\.[a-z]{2,12})\b/gi)]
+        .map((m) => m[1].toLowerCase())
+        .filter((e) => !/\.(png|jpe?g|gif|svg|webp|css|js)$/i.test(e))
+        .filter((e) => !/@(example|yourdomain|domain|email|test|sample|placeholder)\.(com|org|net)$/.test(e))
+        .filter((e) => !/^(you|user|name|email|someone|john\.?doe)@/.test(e)),
+    ).slice(0, 10),
+    socialProfiles: unique(
+      [...html.matchAll(/https?:\/\/(?:www\.)?(twitter\.com|x\.com|linkedin\.com|github\.com|facebook\.com|instagram\.com|youtube\.com|mastodon\.social)\/([A-Za-z0-9_.\-\/]{2,60})/g)]
+        .map((m) => `https://${m[1]}/${m[2]}`.replace(/[/.]+$/, '')),
+    ).slice(0, 12),
+    trackingIds,
+  };
+}
+
+/**
+ * RFC 9116 security.txt. Frequently names a security contact — a person, a
+ * team address, or a disclosure programme — that RDAP redaction hides.
+ */
+async function securityTxt(domain) {
+  let text;
+  try {
+    text = await getText(`https://${domain}/.well-known/security.txt`, {
+      source: `${domain}/.well-known/security.txt`,
+      timeout: 6000,
+    });
+  } catch {
+    return null;
+  }
+
+  // A site that serves its SPA shell for every path will return HTML here.
+  if (/<html|<!doctype/i.test(text) || text.length > 20_000) return null;
+
+  const field = (name) =>
+    [...text.matchAll(new RegExp(`^${name}\\s*:\\s*(.+)$`, 'gim'))]
+      .map((m) => m[1].trim())
+      .filter(Boolean);
+
+  const contacts = field('Contact');
+  if (!contacts.length) return null;
+
+  return {
+    contacts,
+    expires: field('Expires')[0] ?? null,
+    encryption: field('Encryption')[0] ?? null,
+    policy: field('Policy')[0] ?? null,
+    acknowledgments: field('Acknowledgments')[0] ?? null,
+    preferredLanguages: field('Preferred-Languages')[0] ?? null,
+    hiring: field('Hiring')[0] ?? null,
+  };
+}
+
+/**
+ * Internet Archive coverage. RDAP gives the registration date of the *current*
+ * registration; the archive shows when content actually first appeared, which
+ * is what matters when a domain has been dropped and re-registered.
+ */
+async function archiveHistory(domain) {
+  // Two tiny "closest snapshot" queries rather than one CDX range query. The
+  // CDX endpoint returns the full capture list, is slow on large sites, and is
+  // aggressively rate-limited — unworkable from shared egress like a Worker.
+  // This costs two cheap requests and yields the dates that actually matter.
+  const at = async (timestamp) => {
+    const text = await getText(
+      `https://archive.org/wayback/available?url=${encodeURIComponent(domain)}&timestamp=${timestamp}`,
+      { source: 'archive.org', timeout: 8000 },
+    );
+    if (/^\s*</.test(text)) throw new Error('archive.org rate-limited this lookup');
+    return JSON.parse(text)?.archived_snapshots?.closest ?? null;
+  };
+
+  const [earliest, latest] = await Promise.all([at('1996'), at('20991231')]);
+  if (!earliest && !latest) return { archived: false, firstSeen: null, lastSeen: null };
+
+  const toIso = (s) => (s ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : null);
+  return {
+    archived: true,
+    firstSeen: toIso(earliest?.timestamp),
+    lastSeen: toIso(latest?.timestamp),
+    firstSnapshotUrl: earliest?.url ?? null,
+    url: `https://web.archive.org/web/*/${domain}`,
   };
 }
 
@@ -383,6 +560,72 @@ function formatDns(dns) {
     out[type] = { records: result.records, ttl: result.ttl, status: result.status };
   }
   return out;
+}
+
+/* ------------------------------------------------------------------ identity */
+
+/**
+ * Consolidate every attribution signal into one ranked view.
+ *
+ * RDAP registrant data is redacted for most gTLDs post-GDPR, so the answer to
+ * "who runs this domain" usually has to be assembled from what the operator
+ * publishes voluntarily: the site's own metadata, its copyright line, its
+ * security.txt contact. Each candidate carries the source it came from and how
+ * far it can be trusted, because these differ enormously — a registry
+ * registrant field is authoritative, a copyright string is a guess.
+ */
+function identity(data) {
+  const page = data.headers?.page ?? null;
+  const reg = data.registration ?? null;
+  const names = [];
+
+  const add = (value, source, confidence) => {
+    if (!value) return;
+    const clean = String(value).trim();
+    if (clean.length < 2 || clean.length > 120) return;
+    if (names.some((n) => n.value.toLowerCase() === clean.toLowerCase())) return;
+    names.push({ value: clean, source, confidence });
+  };
+
+  // Authoritative when present — but usually redacted.
+  if (reg?.registrant && !reg.registrant.redacted) {
+    add(reg.registrant.organization ?? reg.registrant.name, 'RDAP registrant', 'high');
+  }
+  if (reg?.administrative && !reg.administrative.redacted) {
+    add(reg.administrative.organization ?? reg.administrative.name, 'RDAP admin contact', 'high');
+  }
+
+  // Self-declared, and generally accurate — the operator wrote it.
+  add(page?.siteName, 'og:site_name', 'medium');
+  page?.copyright?.forEach((c) => add(c, 'copyright notice', 'medium'));
+  add(page?.author, 'author meta tag', 'medium');
+
+  // Weakest: a title is marketing copy, not a legal entity.
+  add(page?.title?.split(/\s[|·—–-]\s/)[0], 'page title', 'low');
+
+  const contacts = [];
+  for (const contact of data.securityTxt?.contacts ?? []) {
+    contacts.push({ value: contact.replace(/^mailto:/, ''), source: 'security.txt', role: 'security' });
+  }
+  if (reg?.abuseContact?.email) {
+    contacts.push({ value: reg.abuseContact.email, source: 'RDAP registrar abuse', role: 'abuse' });
+  }
+  for (const email of page?.emails ?? []) {
+    contacts.push({ value: email, source: 'page source', role: 'published' });
+  }
+
+  return {
+    names,
+    contacts: contacts.slice(0, 12),
+    socialProfiles: page?.socialProfiles ?? [],
+    trackingIds: page?.trackingIds ?? [],
+    // Say plainly why the registrant is missing, rather than showing a blank.
+    registrantStatus: reg?.registrant?.redacted
+      ? 'redacted'
+      : reg?.registrant
+        ? 'published'
+        : 'not published',
+  };
 }
 
 /* --------------------------------------------------------------- assessment */
@@ -447,6 +690,38 @@ function assess(domain, data, hosts) {
     if (headers.poweredBy) {
       findings.push({ level: 'info', title: 'Server software disclosed', detail: `\`X-Powered-By: ${headers.poweredBy}\` leaks the backend stack.` });
     }
+  }
+
+  // A site archived long before its current registration date is a re-registered
+  // or transferred domain — the registration date understates its real history,
+  // and the current owner may be unrelated to the archived content.
+  const archived = data.archive;
+  if (archived?.firstSeen && reg?.created) {
+    const gapDays = daysBetween(archived.firstSeen, reg.created);
+    if (gapDays > 365) {
+      findings.push({
+        level: 'info',
+        title: `Archived since ${archived.firstSeen}, ${Math.floor(gapDays / 365)} years before the current registration`,
+        detail: 'The domain was in use well before the registration on record, so it has been re-registered or transferred. Archived content may belong to a previous owner.',
+      });
+    }
+  }
+
+  const identified = data.headers?.page;
+  if (identified?.trackingIds?.length) {
+    findings.push({
+      level: 'info',
+      title: `${identified.trackingIds.length} analytics ID${identified.trackingIds.length === 1 ? '' : 's'} in the page source`,
+      detail: 'The same measurement ID appearing on another site is good evidence of a shared operator. Searchable on publicwww.com and analyzeid.com.',
+    });
+  }
+
+  if (data.securityTxt?.contacts?.length) {
+    findings.push({
+      level: 'info',
+      title: 'Publishes security.txt',
+      detail: `Security contact: ${data.securityTxt.contacts[0]}. A named disclosure channel usually indicates a maintained, staffed domain.`,
+    });
   }
 
   const subCount = data.certificates?.subdomains?.length ?? 0;

@@ -12,6 +12,7 @@
 import { parsePhoneNumberWithError, ParseError, getExampleNumber } from 'libphonenumber-js/max';
 import examples from 'libphonenumber-js/mobile/examples';
 import { parsePhoneInput, ValidationError } from '../lib/validate.js';
+import { getJson } from '../lib/http.js';
 
 /** Human labels for libphonenumber's number types. */
 const TYPE_LABELS = {
@@ -70,6 +71,14 @@ export async function lookupPhone(input, region, loadData, env = {}) {
 
   const type = phone.getType() ?? null;
 
+  // The only legitimate route to a subscriber or business name is CNAM, the
+  // carrier caller-ID database, which is metered. Everything else offering
+  // "phone to name" for free is a data broker or a scraper. Optional by design:
+  // without credentials the lookup simply omits this block.
+  const live = env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
+    ? await twilioLookup(phone.format('E.164'), env).catch((err) => ({ error: err.message }))
+    : null;
+
   return {
     query: { type: 'phone', value, region: hintRegion ?? null },
     valid,
@@ -89,16 +98,54 @@ export async function lookupPhone(input, region, loadData, env = {}) {
     },
     location: geo ?? null,
     carrier: carrier ?? null,
+    // Live, metered enrichment. Null unless Twilio credentials are configured.
+    identity: live && !live.error ? live : null,
+    identityError: live?.error ?? null,
     timezones: Array.isArray(timezones) ? timezones : timezones ? [timezones] : [],
     localTime: localTimes(Array.isArray(timezones) ? timezones : []),
-    caveats: caveats(valid, geo, carrier, type),
+    caveats: caveats(valid, geo, carrier, type, live && !live.error ? live : null),
     example: exampleFor(phone.country),
-    assessment: assess(phone, valid, type, carrier),
+    assessment: assess(phone, valid, type, carrier, live && !live.error ? live : null),
     pivots: pivots(phone.format('E.164')),
     sources: {
       libphonenumber: { ok: true },
       referenceData: { ok: geo !== undefined || carrier !== undefined },
+      ...(live ? { twilioLookup: live.error ? { ok: false, error: live.error } : { ok: true } } : {}),
     },
+  };
+}
+
+/* ----------------------------------------------------------- live enrichment */
+
+/**
+ * Twilio Lookup v2: CNAM caller name and line-type intelligence.
+ *
+ * `caller_name` is the carrier-maintained caller-ID record — a business name,
+ * or a subscriber name for some US landlines. It is the only name source here
+ * that is both authoritative and lawful to query; it is US-only and billed per
+ * lookup. `line_type_intelligence` resolves the *current* carrier after number
+ * portability, which is exactly what the bundled static dataset cannot do.
+ */
+async function twilioLookup(e164, env) {
+  const credentials = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
+  const body = await getJson(
+    `https://lookups.twilio.com/v2/PhoneNumbers/${encodeURIComponent(e164)}` +
+      '?Fields=caller_name,line_type_intelligence',
+    { source: 'lookups.twilio.com', timeout: 9000, headers: { authorization: `Basic ${credentials}` } },
+  );
+
+  const caller = body.caller_name ?? {};
+  const line = body.line_type_intelligence ?? {};
+
+  return {
+    callerName: caller.caller_name ?? null,
+    // "BUSINESS" or "CONSUMER" — worth surfacing, since it frames the name.
+    callerType: caller.caller_type ?? null,
+    currentCarrier: line.carrier_name ?? null,
+    currentLineType: line.type ?? null,
+    mobileCountryCode: line.mobile_country_code ?? null,
+    mobileNetworkCode: line.mobile_network_code ?? null,
+    valid: body.valid ?? null,
   };
 }
 
@@ -146,7 +193,7 @@ function localTimes(zones) {
   });
 }
 
-function caveats(valid, geo, carrier, type) {
+function caveats(valid, geo, carrier, type, live) {
   const notes = [];
   if (valid) {
     notes.push('Validity means the number matches the published numbering plan for its country. It does not mean the number is currently assigned or in service.');
@@ -163,10 +210,16 @@ function caveats(valid, geo, carrier, type) {
   if (type === 'VOIP') {
     notes.push('VoIP numbers have no fixed physical location by design.');
   }
+  if (live?.callerName) {
+    notes.push('Caller ID names are supplied by the carrier and are not verified identity. They are frequently outdated, and for consumer lines often absent entirely.');
+  }
+  if (!live) {
+    notes.push('No subscriber or business name is shown: no free data source provides one. Configure Twilio credentials to enable CNAM caller-ID lookup, which is the only authoritative source and is billed per query.');
+  }
   return notes;
 }
 
-function assess(phone, valid, type, carrier) {
+function assess(phone, valid, type, carrier, live) {
   const findings = [];
 
   if (!valid) {
@@ -191,6 +244,23 @@ function assess(phone, valid, type, carrier) {
   }
   if (carrier) {
     findings.push({ level: 'info', title: `Allocated to ${carrier}`, detail: 'Original range holder. Verify against portability data before relying on this.' });
+  }
+
+  if (live?.callerName) {
+    findings.push({
+      level: 'info',
+      title: `Caller ID: ${live.callerName}`,
+      detail: live.callerType === 'BUSINESS'
+        ? 'CNAM business listing from the carrier database.'
+        : 'CNAM subscriber listing. Carrier-maintained, and often stale or absent.',
+    });
+  }
+  if (live?.currentCarrier && live.currentCarrier !== carrier) {
+    findings.push({
+      level: 'info',
+      title: `Currently on ${live.currentCarrier}`,
+      detail: `The range was allocated to ${carrier ?? 'another operator'}, so this number has been ported.`,
+    });
   }
   return findings;
 }

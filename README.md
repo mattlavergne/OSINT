@@ -34,6 +34,7 @@ Google's libphonenumber rules via `libphonenumber-js`, plus the geocoding, carri
 - Every timezone the number could sit in, with current local time
 - E.164 / international / national / RFC 3966 formats
 - Search pivots (Google, Truecaller, WhatsApp, Telegram) — links are *built*, never followed
+- Optional CNAM caller-ID name and post-portability carrier via Twilio (see below)
 
 Validity, location and carrier each carry a stated caveat, because all three are routinely over-read. A valid number need not be in service; an allocation area is not a device location; number portability means the carrier may be years out of date.
 
@@ -46,6 +47,10 @@ Validity, location and carrier each carry a stated caveat, because all three are
 - **Hosting**: each resolved address enriched with geolocation, ASN and open ports
 - **HTTP posture**: one ordinary HTTPS GET of the site root to read HSTS, CSP, X-Frame-Options, CDN fingerprint and disclosed server software
 - **Service verification TXT records**, which reveal the SaaS platforms an organisation uses
+- **Attribution**: candidate organisation names assembled from RDAP, `og:site_name`, the copyright line and the page title — each tagged with its source and a confidence level, because a registry field and a marketing title are not equally trustworthy
+- **Contacts**: `security.txt` (RFC 9116), RDAP abuse contact, and addresses published in the page
+- **Linked social profiles** and **analytics IDs** (GA4, UA, GTM, Meta Pixel, Hotjar) — a shared measurement ID across sites is strong evidence of a common operator
+- **Archive history**: first and last Wayback capture, which exposes domains re-registered long after their content first appeared
 
 ### IP
 - Geolocation **with a precision label** (city / region / country) so coordinates are not mistaken for an address
@@ -53,6 +58,8 @@ Validity, location and carrier each carry a stated caveat, because all three are
 - Reverse DNS (PTR)
 - Shodan **InternetDB** (free, keyless): open ports, known CVEs, observed hostnames, software CPEs
 - Hosting/CDN detection, which reframes what the geolocation actually means
+- **BGP routing** from RIPEstat: announced prefix, origin AS and holder, announcement status — who announces a prefix is harder to falsify than a geolocation record
+- **Co-hosted domains** on the same address, which names the operator on dedicated hosting and flags shared infrastructure when it is not
 - Non-routable input (RFC 1918, loopback, CGNAT, link-local) short-circuits with an explanation instead of four upstream errors
 
 ---
@@ -69,20 +76,34 @@ Every source below is free and **needs no API key**.
 | [Shodan InternetDB](https://internetdb.shodan.io) | Open ports, CVEs, hostnames |
 | [Cert Spotter](https://sslmate.com/ct_search_api/) | Certificate Transparency (fast) |
 | [crt.sh](https://crt.sh) | Certificate Transparency (deep history) |
-| [HackerTarget](https://hackertarget.com/) | Passive DNS host search |
+| [HackerTarget](https://hackertarget.com/) | Passive DNS host search, reverse-IP co-hosting |
+| [RIPEstat](https://stat.ripe.net/) | BGP prefix, origin AS and announcement status |
+| [archive.org](https://archive.org/help/wayback_api.php) | First and last archived capture |
+| The site's own HTML | Title, org name, copyright entity, contacts, social profiles, analytics IDs |
+| `/.well-known/security.txt` | Published security contact (RFC 9116) |
 | libphonenumber | Phone validation, geocoding, carrier, timezones |
 
 ### Optional enrichment
 
-Three keys unlock extra panels. All are optional; nothing breaks without them.
+These unlock extra panels. All are optional; nothing breaks without them.
 
 ```sh
 npx wrangler secret put SHODAN_API_KEY       # deeper host detail
 npx wrangler secret put VIRUSTOTAL_API_KEY   # vendor reputation for domains and IPs
 npx wrangler secret put ABUSEIPDB_API_KEY    # abuse confidence score for IPs
+npx wrangler secret put TWILIO_ACCOUNT_SID   # CNAM caller-ID name for phone numbers
+npx wrangler secret put TWILIO_AUTH_TOKEN
 ```
 
 For the Node server, set them as environment variables instead. See `.dev.vars.example`.
+
+### On getting a person's name from a phone number
+
+There is no free source for this, and the tool does not pretend otherwise.
+
+Truecaller and its equivalents have no public API and prohibit scraping; the services that do return names are paid data brokers. The one authoritative and lawful source is **CNAM**, the caller-ID database carriers maintain, which GhostTrace reads through Twilio Lookup when credentials are configured. Even then it is US-centric, usually returns a business rather than a person, and is frequently stale or empty for consumer mobile lines — the payload says so in its caveats rather than presenting it as identity.
+
+What *is* freely available for a phone number is the numbering-plan data already shown: validity, line type, allocation area, the originally allocated carrier, and timezones. Twilio additionally resolves the *current* carrier after number portability, which the bundled static dataset structurally cannot.
 
 ---
 
@@ -159,12 +180,12 @@ The strip is conditional, so the same build also works unprefixed on a `*.worker
 | Limit | Free plan | What this app uses |
 |---|---|---|
 | Worker requests | 100,000/day | one per lookup, plus one per static asset |
-| Subrequests per request | 50 | measured 4 (IP), 25 (domain, worst case), 0 (phone) |
+| Subrequests per request | 50 | measured 6 (IP), 29 (domain, worst case), 0 (phone) |
 | CPU time per request | 10 ms | lookups are I/O-bound, not CPU-bound |
 | Static asset requests | free, not billed as requests | — |
 | Worker bundle size | 3 MB compressed | code only; the ~8 MB of phone data is assets, not bundle |
 
-The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 25, and redirect hops plus DoH fallbacks push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
+The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 29, and redirect hops plus DoH fallbacks push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
 
 ### Alternative: a subdomain instead of a path
 

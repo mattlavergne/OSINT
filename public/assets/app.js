@@ -328,6 +328,16 @@ function renderPhone(d) {
         ['Example for region', d.example ? html`<span class="mono muted">${d.example}</span>` : null],
       ]))}
 
+      ${d.identity ? card('Caller identity', dl([
+        ['Caller name', d.identity.callerName
+          ? html`<strong>${d.identity.callerName}</strong>` : html`<span class="muted">no CNAM listing</span>`],
+        ['Listing type', d.identity.callerType],
+        ['Current carrier', d.identity.currentCarrier],
+        ['Current line type', d.identity.currentLineType],
+        ['MCC / MNC', d.identity.mobileCountryCode
+          ? `${d.identity.mobileCountryCode} / ${d.identity.mobileNetworkCode}` : null],
+      ])) : raw('')}
+
       ${d.localTime?.length ? card('Local time', html`
         <ul class="record-list">
           ${d.localTime.map((t) => html`<li>${t.zone} — ${t.time ?? 'unknown'}</li>`)}
@@ -405,6 +415,31 @@ function renderIp(d) {
       ` : html`<p class="muted">Shodan has never observed this address. That usually means nothing is listening on a scanned port.</p>`,
         { count: exp.seen ? exp.ports.length : null }) : raw('')}
 
+      ${d.routing ? card('BGP routing', dl([
+        ['Announced prefix', d.routing.announcedPrefix ? html`<span class="mono">${d.routing.announcedPrefix}</span>` : null],
+        ['Currently announced', d.routing.announced === true ? html`<span class="pill good">yes</span>`
+          : d.routing.announced === false ? html`<span class="pill warn">no</span>` : null],
+        ['Origin AS', d.routing.originAsns?.length
+          ? html`${d.routing.originAsns.map((a) => html`<span class="mono">${a.asn}</span>${a.holder ? ` — ${a.holder}` : ''}`)}`
+          : null],
+        ['Registry block', d.routing.blockDescription],
+        ['Covering prefix', d.routing.relatedPrefixes?.length
+          ? html`<span class="mono">${d.routing.relatedPrefixes.join(', ')}</span>` : null],
+      ])) : raw('')}
+
+      ${d.hostedDomains ? card('Domains on this address', d.hostedDomains.count ? html`
+        <div class="scroll">
+          <ul class="record-list">${d.hostedDomains.domains.map((n) => html`<li>${n}</li>`)}</ul>
+        </div>
+        <p class="note">
+          ${d.hostedDomains.shared
+            ? 'Shared hosting or a CDN front — this address does not identify a single owner.'
+            : 'Few names resolve here, which suggests dedicated hosting.'}
+          ${d.hostedDomains.truncated ? ' Showing the first 100.' : ''}
+        </p>
+      ` : html`<p class="muted">No domains found resolving to this address.</p>`,
+        { wide: d.hostedDomains.count > 12, count: d.hostedDomains.count }) : raw('')}
+
       ${d.abuse ? card('Abuse reports', dl([
         ['Confidence', html`<span class="pill ${d.abuse.confidenceScore >= 50 ? 'bad' : d.abuse.confidenceScore > 0 ? 'warn' : 'good'}">${d.abuse.confidenceScore}%</span>`],
         ['Reports (90d)', d.abuse.totalReports],
@@ -436,8 +471,62 @@ function renderDomain(d) {
   const email = d.email;
   const dns = d.dns ?? {};
 
+  const id = d.identity;
+
   return html`
     <div class="cards">
+      ${id && (id.names.length || id.contacts.length || id.socialProfiles.length) ? card('Attribution', html`
+        ${id.names.length ? html`
+          <h4 class="rrtype">Candidate names</h4>
+          <ul class="record-list">
+            ${id.names.map((n) => html`<li>${n.value} <span class="pill ${n.confidence === 'high' ? 'good' : n.confidence === 'low' ? 'warn' : ''}">${n.confidence}</span> <span class="muted">${n.source}</span></li>`)}
+          </ul>` : html`<p class="note">No organisation name is published. Registrant is ${id.registrantStatus}.</p>`}
+
+        ${id.contacts.length ? html`
+          <h4 class="rrtype">Contacts</h4>
+          <ul class="record-list">
+            ${id.contacts.map((c) => html`<li>${c.value} <span class="muted">${c.source}</span></li>`)}
+          </ul>` : ''}
+
+        ${id.socialProfiles.length ? html`
+          <h4 class="rrtype">Linked profiles</h4>
+          <div class="pivots">
+            ${id.socialProfiles.map((u) => html`<a class="pivot" href="${u}" target="_blank" rel="noopener noreferrer">${u.replace(/^https:\/\//, '')}${ICON_EXTERNAL}</a>`)}
+          </div>` : ''}
+
+        ${id.trackingIds.length ? html`
+          <h4 class="rrtype">Analytics IDs</h4>
+          <ul class="record-list">
+            ${id.trackingIds.map((t) => html`<li>${t.id} <span class="muted">${t.type}</span></li>`)}
+          </ul>
+          <p class="note">The same ID on another site indicates a shared operator. Searchable on publicwww.com and analyzeid.com.</p>` : ''}
+      `, { wide: true }) : raw('')}
+
+      ${d.page ? card('Site', dl([
+        ['Title', d.page.title],
+        ['Description', d.page.description],
+        ['Site name', d.page.siteName],
+        ['Author', d.page.author],
+        ['Generator', d.page.generator ? html`<span class="pill">${d.page.generator}</span>` : null],
+        ['Language', d.page.language],
+      ])) : raw('')}
+
+      ${d.archive?.archived ? card('Archive history', dl([
+        ['First archived', d.archive.firstSnapshotUrl
+          ? html`<a href="${d.archive.firstSnapshotUrl}" target="_blank" rel="noopener noreferrer">${d.archive.firstSeen}</a>`
+          : d.archive.firstSeen],
+        ['Last archived', d.archive.lastSeen],
+        ['All captures', html`<a href="${d.archive.url}" target="_blank" rel="noopener noreferrer">Wayback Machine</a>`],
+      ])) : raw('')}
+
+      ${d.securityTxt ? card('security.txt', dl([
+        ['Contact', d.securityTxt.contacts.join(', ')],
+        ['Policy', d.securityTxt.policy],
+        ['Expires', formatDate(d.securityTxt.expires)],
+        ['Acknowledgments', d.securityTxt.acknowledgments],
+        ['Hiring', d.securityTxt.hiring],
+      ])) : raw('')}
+
       ${reg ? card('Registration', dl([
         ['Registrar', reg.registrar],
         ['IANA ID', reg.registrarIana],
@@ -627,6 +716,10 @@ function toMarkdown(d) {
       ['E.164', d.formats?.e164], ['Allocated area', d.location], ['Carrier', d.carrier],
       ['Timezones', d.timezones],
     ]);
+    section('Caller identity (CNAM)', [
+      ['Caller name', d.identity?.callerName], ['Listing type', d.identity?.callerType],
+      ['Current carrier', d.identity?.currentCarrier], ['Current line type', d.identity?.currentLineType],
+    ]);
     if (d.caveats?.length) {
       lines.push('## Caveats', '', ...d.caveats.map((c) => `- ${c}`), '');
     }
@@ -640,12 +733,32 @@ function toMarkdown(d) {
       ['Organisation', d.geolocation?.organization], ['ASN', d.geolocation?.asn],
       ['Reverse DNS', d.reverseDns], ['Netblock', d.registry?.cidr ?? d.registry?.range],
       ['Abuse contact', d.registry?.abuseContact?.email],
+      ['Announced prefix', d.routing?.announcedPrefix],
+      ['Origin AS', d.routing?.originAsns?.map((a) => `${a.asn}${a.holder ? ` (${a.holder})` : ''}`)],
     ]);
+    if (d.hostedDomains?.count) {
+      lines.push(`## Domains on this address (${d.hostedDomains.count})`, '',
+        ...d.hostedDomains.domains.map((n) => `- ${n}`), '');
+    }
     section('Exposure', [
       ['Open ports', d.exposure?.ports], ['Known CVEs', d.exposure?.vulnerabilities],
       ['Hostnames', d.exposure?.hostnames],
     ]);
   } else {
+    section('Attribution', [
+      ['Candidate names', d.identity?.names?.map((n) => `${n.value} (${n.source}, ${n.confidence} confidence)`)],
+      ['Contacts', d.identity?.contacts?.map((c) => `${c.value} (${c.source})`)],
+      ['Linked profiles', d.identity?.socialProfiles],
+      ['Analytics IDs', d.identity?.trackingIds?.map((t) => `${t.id} (${t.type})`)],
+      ['Registrant status', d.identity?.registrantStatus],
+    ]);
+    section('Site', [
+      ['Title', d.page?.title], ['Description', d.page?.description],
+      ['Site name', d.page?.siteName], ['Generator', d.page?.generator],
+    ]);
+    section('Archive', [
+      ['First archived', d.archive?.firstSeen], ['Last archived', d.archive?.lastSeen],
+    ]);
     section('Registration', [
       ['Registrar', d.registration?.registrar], ['Created', d.registration?.created],
       ['Expires', d.registration?.expires], ['Age (days)', d.registration?.ageDays],
