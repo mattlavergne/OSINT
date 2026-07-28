@@ -34,7 +34,8 @@ Google's libphonenumber rules via `libphonenumber-js`, plus the geocoding, carri
 - Every timezone the number could sit in, with current local time
 - E.164 / international / national / RFC 3966 formats
 - Search pivots (Google, Truecaller, WhatsApp, Telegram) — links are *built*, never followed
-- Optional CNAM caller-ID name and post-portability carrier via Twilio (see below)
+- **Reverse name lookup** for businesses: OpenStreetMap and SEC EDGAR, both free and keyless, merged into a ranked attribution list with per-source confidence
+- Optional CNAM caller-ID name via Twilio, and search footprint via Brave (see below)
 
 Validity, location and carrier each carry a stated caveat, because all three are routinely over-read. A valid number need not be in service; an allocation area is not a device location; number portability means the carrier may be years out of date.
 
@@ -84,6 +85,7 @@ Every source below is free and **needs no API key**.
 | The site's own HTML | Title, org name, copyright entity, contacts, social profiles, analytics IDs |
 | `/.well-known/security.txt` | Published security contact (RFC 9116) |
 | [OpenStreetMap Overpass](https://overpass-api.de/) | Reverse phone → business/POI name, address and website |
+| [SEC EDGAR full-text](https://efts.sec.gov/) | Reverse phone → US public company, confirmed against its filed number |
 | libphonenumber | Phone validation, geocoding, carrier, timezones |
 
 ### Optional enrichment
@@ -96,6 +98,7 @@ npx wrangler secret put VIRUSTOTAL_API_KEY   # vendor reputation for domains and
 npx wrangler secret put ABUSEIPDB_API_KEY    # abuse confidence score for IPs
 npx wrangler secret put TWILIO_ACCOUNT_SID   # CNAM caller-ID name for phone numbers
 npx wrangler secret put TWILIO_AUTH_TOKEN
+npx wrangler secret put BRAVE_SEARCH_API_KEY # search footprint for phone numbers
 ```
 
 For the Node server, set them as environment variables instead. See `.dev.vars.example`.
@@ -104,7 +107,13 @@ For the Node server, set them as environment variables instead. See `.dev.vars.e
 
 The answer splits cleanly in two, and it is worth being precise about which half you are in.
 
-**Businesses and public places — yes, free.** GhostTrace reverse-queries **OpenStreetMap** via Overpass. Where a business has been mapped with its phone number, this returns the name, category, brand, street address, website and a link to the OSM record. `+1 212-343-3355` resolves to Hard Rock Cafe, 1501 Broadway, with its website. It is open data (ODbL), keyless, and the operator published the number themselves. Coverage is the limitation, not licensing: it hits for mapped businesses and misses everything else.
+**Businesses and organisations — yes, free, from three angles.**
+
+- **OpenStreetMap**, via Overpass. Where a business has been mapped with its phone number, this returns the name, category, brand, street address, website and a link to the OSM record. `+1 212-343-3355` resolves to Hard Rock Cafe, 1501 Broadway. Open data (ODbL), keyless.
+- **SEC EDGAR full-text search**, for US public companies. Every registrant files its principal phone number, and the index is free, keyless and official. `+1 408 996 1010` resolves to Apple Inc. — and because a full-text hit alone is weak evidence (the number may appear in a filing for any reason), each candidate is confirmed against the phone on its own EDGAR profile. Only an exact match is reported as the filer's own number; everything else is labelled *mentioned in filings*.
+- **Search footprint**, needing a free Brave Search API key. This runs the search a human would run and returns the real titles and snippets. It is what [PhoneInfoga](https://github.com/sundowndev/phoneinfoga) automates only halfway — it builds dork URLs and leaves the searching to you. Reverse-lookup spam sites, which dominate these results and name nobody, are filtered out of the name candidates.
+
+All name candidates are merged into one ranked list, each tagged with its source and a confidence band: **high** means the entity published this number as its own, **medium** means a maintained public dataset lists it, **low** means a search engine surfaced it. A name corroborated by independent sources ranks above one that is not.
 
 **Individuals — no free source exists.** This is not a gap in the implementation:
 

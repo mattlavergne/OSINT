@@ -328,6 +328,57 @@ function renderPhone(d) {
         ['Example for region', d.example ? html`<span class="mono muted">${d.example}</span>` : null],
       ]))}
 
+      ${d.attribution?.names?.length ? card('Attribution', html`
+        ${d.attribution.best ? html`
+          <dl>
+            <dt>Best match</dt>
+            <dd>
+              <strong>${d.attribution.best.value}</strong>
+              <span class="pill ${d.attribution.best.confidence === 'high' ? 'good' : d.attribution.best.confidence === 'low' ? 'warn' : ''}">${d.attribution.best.confidence} confidence</span>
+            </dd>
+          </dl>` : ''}
+        <h4 class="rrtype">All candidates</h4>
+        <ul class="record-list">
+          ${d.attribution.names.map((n) => html`<li>
+            ${n.value}
+            <span class="pill ${n.confidence === 'high' ? 'good' : n.confidence === 'low' ? 'warn' : ''}">${n.confidence}</span>
+            <span class="muted">${n.source}${n.corroboration > 1 ? ` · corroborated by ${n.corroboration} sources` : ''}</span>
+            ${n.detail ? html`<br><span class="muted">${n.detail}</span>` : ''}
+          </li>`)}
+        </ul>
+        <p class="note">Checked: ${d.attribution.checked.join(', ')}. Confidence reflects what a hit proves —
+          <em>high</em> means the entity published this number as its own, <em>low</em> means a search engine surfaced it.</p>
+      `, { wide: true, count: d.attribution.names.length }) : raw('')}
+
+      ${d.filings?.companies?.length ? card('SEC filings', html`
+        <div class="scroll"><table>
+          <thead><tr><th>Company</th><th>Filed number</th><th>Industry</th><th>Location</th></tr></thead>
+          <tbody>${d.filings.companies.map((c) => html`
+            <tr>
+              <td><a href="${c.edgarUrl}" target="_blank" rel="noopener noreferrer">${c.name}</a>
+                ${c.tickers?.length ? html` <span class="pill">${c.tickers.join(', ')}</span>` : ''}
+                ${c.confirmed ? html` <span class="pill good">filed</span>` : html` <span class="pill warn">mentioned</span>`}</td>
+              <td class="mono">${c.phone ?? '—'}</td>
+              <td>${c.industry || '—'}</td>
+              <td>${c.location ?? '—'}</td>
+            </tr>`)}</tbody>
+        </table></div>
+        <p class="note">${d.filings.totalFilings} filing(s) contain this number.
+          <strong>Filed</strong> means it is the number on that company's own EDGAR profile;
+          <strong>mentioned</strong> means it merely appears in their filings and may belong to an agent or counterparty.</p>
+      `, { wide: true, count: d.filings.companies.length }) : raw('')}
+
+      ${d.search?.results?.length ? card('Search footprint', html`
+        <div class="scroll">
+          ${d.search.results.map((r) => html`
+            <h4 class="rrtype"><a href="${r.url}" target="_blank" rel="noopener noreferrer">${r.title ?? r.url}</a></h4>
+            ${r.snippet ? html`<p class="note">${r.snippet}</p>` : ''}
+          `)}
+        </div>
+        <p class="note">Unverified search results for <span class="mono">${d.search.query}</span>.
+          Reverse-lookup spam sites are filtered out of the name candidates but may still appear here.</p>
+      `, { wide: true, count: d.search.resultCount }) : raw('')}
+
       ${d.places?.length ? card('Matched in OpenStreetMap', html`
         ${d.places.map((pl) => html`
           <h4 class="rrtype">${pl.name}${pl.category ? html` <span class="pill">${pl.category}</span>` : ''}</h4>
@@ -738,6 +789,19 @@ function toMarkdown(d) {
       ['E.164', d.formats?.e164], ['Allocated area', d.location], ['Carrier', d.carrier],
       ['Timezones', d.timezones],
     ]);
+    section('Attribution', [
+      ['Best match', d.attribution?.best ? `${d.attribution.best.value} (${d.attribution.best.source}, ${d.attribution.best.confidence} confidence)` : null],
+      ['All candidates', d.attribution?.names?.map((n) => `${n.value} — ${n.source}, ${n.confidence}`)],
+      ['Sources checked', d.attribution?.checked],
+    ]);
+    if (d.filings?.companies?.length) {
+      lines.push('## SEC filings', '',
+        ...d.filings.companies.map((c) => `- **${c.name}** (${c.confirmed ? 'filed' : 'mentioned'})${c.phone ? ` — ${c.phone}` : ''}${c.location ? ` — ${c.location}` : ''}`), '');
+    }
+    if (d.search?.results?.length) {
+      lines.push('## Search footprint', '',
+        ...d.search.results.map((r) => `- [${r.title ?? r.url}](${r.url})`), '');
+    }
     if (d.places?.length) {
       lines.push('## OpenStreetMap matches', '',
         ...d.places.map((pl) => `- **${pl.name}**${pl.category ? ` (${pl.category})` : ''}${pl.address ? ` — ${pl.address}` : ''}${pl.website ? ` — ${pl.website}` : ''}`), '');

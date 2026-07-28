@@ -17,3 +17,14 @@ ABUSEIPDB_API_KEY=
 # caller name; line-type intelligence is international.
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
+
+# https://api-dashboard.search.brave.com/  -> runs the search a human would run
+# for a phone number and returns the actual titles and snippets, instead of just
+# building dork links. The highest-yield technique for naming a business number.
+# Free tier: 2,000 queries/month, 1 query/second.
+#
+# There is no keyless alternative that works from a Worker: DuckDuckGo's HTML
+# endpoint returns a bot challenge to datacenter addresses, its Instant Answer
+# API has nothing for phone numbers, and public SearxNG instances serve a
+# captcha. All three were tested.
+BRAVE_SEARCH_API_KEY=

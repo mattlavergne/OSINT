@@ -76,13 +76,21 @@ export async function lookupPhone(input, region, loadData, env = {}) {
   //    and public POIs. Never individuals.
   //  - Twilio CNAM: the carrier caller-ID database. Metered, and the only
   //    source that can name a subscriber.
-  const [places, live] = await Promise.all([
+  const [places, filings, footprint, live] = await Promise.all([
     valid ? openStreetMap(phone).catch((err) => ({ error: err.message })) : null,
+    valid ? secEdgar(phone).catch((err) => ({ error: err.message })) : null,
+    valid && env.BRAVE_SEARCH_API_KEY
+      ? searchFootprint(phone, env.BRAVE_SEARCH_API_KEY).catch((err) => ({ error: err.message }))
+      : null,
     env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
       ? twilioLookup(phone.format('E.164'), env).catch((err) => ({ error: err.message }))
       : null,
   ]);
+
   const osm = places && !places.error ? places : null;
+  const sec = filings && !filings.error ? filings : null;
+  const search = footprint && !footprint.error ? footprint : null;
+  const cnam = live && !live.error ? live : null;
 
   return {
     query: { type: 'phone', value, region: hintRegion ?? null },
@@ -104,20 +112,28 @@ export async function lookupPhone(input, region, loadData, env = {}) {
     location: geo ?? null,
     carrier: carrier ?? null,
     // Live, metered enrichment. Null unless Twilio credentials are configured.
-    identity: live && !live.error ? live : null,
+    identity: cnam,
     identityError: live?.error ?? null,
     // Free, keyless business attribution from OpenStreetMap.
     places: osm?.places ?? [],
+    // US public companies, from SEC EDGAR full-text search.
+    filings: sec?.matched ? sec : null,
+    // Search-engine footprint. Null unless a Brave key is configured.
+    search,
+    // Every name candidate, ranked and labelled with where it came from.
+    attribution: attribution({ osm, sec, search, cnam }),
     timezones: Array.isArray(timezones) ? timezones : timezones ? [timezones] : [],
     localTime: localTimes(Array.isArray(timezones) ? timezones : []),
-    caveats: caveats(valid, geo, carrier, type, live && !live.error ? live : null, osm),
+    caveats: caveats(valid, geo, carrier, type, cnam, osm, sec, search),
     example: exampleFor(phone.country),
-    assessment: assess(phone, valid, type, carrier, live && !live.error ? live : null, osm),
+    assessment: assess(phone, valid, type, carrier, cnam, osm, sec),
     pivots: pivots(phone.format('E.164')),
     sources: {
       libphonenumber: { ok: true },
       referenceData: { ok: geo !== undefined || carrier !== undefined },
       ...(places ? { openStreetMap: places.error ? { ok: false, error: places.error } : { ok: true } } : {}),
+      ...(filings ? { secEdgar: filings.error ? { ok: false, error: filings.error } : { ok: true } } : {}),
+      ...(footprint ? { searchFootprint: footprint.error ? { ok: false, error: footprint.error } : { ok: true } } : {}),
       ...(live ? { twilioLookup: live.error ? { ok: false, error: live.error } : { ok: true } } : {}),
     },
   };
@@ -213,6 +229,235 @@ function phoneSpellings(phone) {
   ])].filter(Boolean);
 }
 
+/* ------------------------------------------------------------- attribution */
+
+/**
+ * Merge every name candidate into one ranked list.
+ *
+ * The sources differ enormously in what a hit actually proves, so each
+ * candidate carries its origin and a confidence band rather than being blended
+ * into a single answer:
+ *
+ *   high    the entity filed or published this number as its own
+ *   medium  a maintained public dataset lists it against this entity
+ *   low     a search engine surfaced it; unverified
+ */
+function attribution({ osm, sec, search, cnam }) {
+  const names = [];
+  const add = (value, source, confidence, detail = null) => {
+    if (!value) return;
+    const clean = String(value).trim();
+    if (clean.length < 2 || clean.length > 120) return;
+    const existing = names.find((n) => n.value.toLowerCase() === clean.toLowerCase());
+    if (existing) {
+      // Corroboration across independent sources is the strongest signal here.
+      existing.corroboration = (existing.corroboration ?? 1) + 1;
+      return;
+    }
+    names.push({ value: clean, source, confidence, detail, corroboration: 1 });
+  };
+
+  for (const company of sec?.companies ?? []) {
+    add(
+      company.name,
+      'SEC EDGAR',
+      company.confirmed ? 'high' : 'low',
+      company.confirmed
+        ? `Filed as the company's own number${company.location ? ` · ${company.location}` : ''}`
+        : 'Mentioned in filings, but not the number on their EDGAR profile',
+    );
+  }
+
+  if (cnam?.callerName) {
+    add(cnam.callerName, 'CNAM caller ID', 'high',
+      cnam.callerType === 'BUSINESS' ? 'Carrier business listing' : 'Carrier subscriber listing');
+  }
+
+  for (const place of osm?.places ?? []) {
+    add(place.name, 'OpenStreetMap', 'medium',
+      [place.category, place.address].filter(Boolean).join(' · ') || null);
+  }
+
+  for (const candidate of search?.candidateNames ?? []) {
+    add(candidate.value, 'Search results', 'low',
+      `Appears in ${candidate.mentions} of the top search results`);
+  }
+
+  const rank = { high: 0, medium: 1, low: 2 };
+  names.sort((a, b) =>
+    rank[a.confidence] - rank[b.confidence] || b.corroboration - a.corroboration);
+
+  return {
+    names,
+    // The honest headline: only promote a name the number's owner published.
+    best: names.find((n) => n.confidence === 'high') ?? names[0] ?? null,
+    checked: [
+      osm ? 'OpenStreetMap' : null,
+      sec ? 'SEC EDGAR' : null,
+      search ? 'Search results' : null,
+      cnam ? 'CNAM caller ID' : null,
+    ].filter(Boolean),
+  };
+}
+
+/* ------------------------------------------------------------ SEC filings */
+
+/** Digits only, for comparing numbers written in different styles. */
+const digitsOf = (value) => String(value ?? '').replace(/\D/g, '');
+
+/**
+ * SEC EDGAR full-text search.
+ *
+ * Every US public company files its principal phone number with the SEC, and
+ * EDGAR's full-text index is free, keyless and official. Narrow coverage by
+ * design — US registrants only — but when it hits, the attribution is as
+ * authoritative as it gets: a number a company filed under penalty of perjury.
+ *
+ * A full-text hit alone is weak evidence, since the number may appear in a
+ * filing for any reason (an agent, a counterparty, a target). So each candidate
+ * company is confirmed against the phone on its own EDGAR profile, and only an
+ * exact digit match is reported as the filer's own number.
+ */
+async function secEdgar(phone) {
+  // Two spellings is enough: EDGAR normalises little, but filings overwhelmingly
+  // use the national format, with E.164 as the occasional alternative.
+  const spellings = [phone.formatNational(), phone.format('E.164')];
+  const wanted = digitsOf(phone.format('E.164'));
+
+  for (const spelling of spellings) {
+    let body;
+    try {
+      body = await getJson(
+        `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(`"${spelling}"`)}`,
+        { source: 'efts.sec.gov', timeout: 10000 },
+      );
+    } catch {
+      continue;
+    }
+
+    const hits = body.hits?.hits ?? [];
+    if (!hits.length) continue;
+
+    const ciks = [...new Set(hits.flatMap((h) => h._source?.ciks ?? []))].slice(0, 3);
+    const companies = (await Promise.all(ciks.map((cik) => secCompany(cik, wanted))))
+      .filter(Boolean);
+
+    if (companies.length) {
+      return {
+        matched: true,
+        totalFilings: body.hits?.total?.value ?? hits.length,
+        companies,
+      };
+    }
+  }
+
+  return { matched: false, totalFilings: 0, companies: [] };
+}
+
+async function secCompany(cik, wantedDigits) {
+  const padded = String(cik).padStart(10, '0');
+  let body;
+  try {
+    body = await getJson(`https://data.sec.gov/submissions/CIK${padded}.json`, {
+      source: 'data.sec.gov',
+      timeout: 8000,
+    });
+  } catch {
+    return null;
+  }
+
+  const business = body.addresses?.business ?? {};
+  // Compare on the last 10 digits so a filed number without a country code
+  // still matches an E.164 query.
+  const filed = digitsOf(body.phone);
+  const confirmed = filed.length >= 7 && wantedDigits.endsWith(filed.slice(-10));
+
+  return {
+    name: body.name ?? null,
+    cik: padded,
+    phone: body.phone ?? null,
+    // "Filed by this company" vs "merely mentioned in its filings".
+    confirmed,
+    industry: body.sicDescription ?? null,
+    tickers: body.tickers ?? [],
+    location: [business.city, business.stateOrCountry].filter(Boolean).join(', ') || null,
+    edgarUrl: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${padded}`,
+  };
+}
+
+/* --------------------------------------------------------- search footprint */
+
+/**
+ * Run the search a human would run, and return what comes back.
+ *
+ * This is the single highest-yield technique in phone OSINT, and it is what
+ * PhoneInfoga automates only halfway — it builds dork URLs and leaves the
+ * searching to you. Running it server-side and surfacing titles and snippets
+ * closes that gap.
+ *
+ * Requires a Brave Search API key. There is no keyless option that works from a
+ * Worker: DuckDuckGo's HTML endpoint returns a bot challenge to datacenter
+ * addresses, its Instant Answer API has no results for phone numbers, and
+ * public SearxNG instances serve a captcha. Brave's free tier covers 2,000
+ * queries a month.
+ */
+async function searchFootprint(phone, key) {
+  const query = `"${phone.formatNational()}" OR "${phone.format('E.164')}"`;
+
+  const body = await getJson(
+    `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=10`,
+    {
+      source: 'api.search.brave.com',
+      timeout: 9000,
+      headers: { 'x-subscription-token': key, accept: 'application/json' },
+    },
+  );
+
+  const results = (body.web?.results ?? []).slice(0, 10).map((r) => ({
+    title: r.title ?? null,
+    url: r.url ?? null,
+    // Brave marks the matched terms with <strong>; strip to plain text.
+    snippet: (r.description ?? '').replace(/<[^>]+>/g, '').trim() || null,
+    siteName: r.profile?.name ?? null,
+  }));
+
+  return {
+    query,
+    resultCount: results.length,
+    results,
+    candidateNames: nameCandidatesFrom(results),
+  };
+}
+
+/**
+ * Guess organisation names from result titles.
+ *
+ * Titles are mostly "<Name> | <tagline>" or "<Name> - <city>", so the leading
+ * segment is usually the entity. A name that shows up across several
+ * independent results is far more likely to be real than a one-off, so
+ * candidates are ranked by how many results mention them.
+ */
+function nameCandidatesFrom(results) {
+  const counts = new Map();
+
+  for (const result of results) {
+    if (!result.title) continue;
+    const lead = result.title.split(/\s[|·—–-]\s|,\s/)[0].trim();
+
+    // Directory and spam sites dominate these results and name nobody.
+    if (/whitepages|truecaller|spokeo|yellowpages|numlookup|whocalled|phone|caller|scam|lookup|directory|reverse/i.test(lead)) continue;
+    if (lead.length < 3 || lead.length > 60 || /^\d+$/.test(lead)) continue;
+
+    const key = lead.toLowerCase();
+    counts.set(key, { value: lead, count: (counts.get(key)?.count ?? 0) + 1 });
+  }
+
+  return [...counts.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5)
+    .map((c) => ({ value: c.value, mentions: c.count }));
+}
+
 /* ----------------------------------------------------------- live enrichment */
 
 /**
@@ -291,7 +536,7 @@ function localTimes(zones) {
   });
 }
 
-function caveats(valid, geo, carrier, type, live, osm) {
+function caveats(valid, geo, carrier, type, live, osm, sec, search) {
   const notes = [];
   if (valid) {
     notes.push('Validity means the number matches the published numbering plan for its country. It does not mean the number is currently assigned or in service.');
@@ -314,13 +559,22 @@ function caveats(valid, geo, carrier, type, live, osm) {
   if (osm?.matched) {
     notes.push('The OpenStreetMap match is community-contributed and may be out of date or refer to a previous occupant of the premises. Treat it as a lead to confirm, not a fact.');
   }
-  if (!live && !osm?.matched) {
-    notes.push('No name was found. OpenStreetMap only covers mapped businesses and public places, never individuals, and no free source exists for subscriber names. Configuring Twilio credentials enables CNAM caller-ID lookup, which is the only authoritative name source and is billed per query.');
+  if (sec?.companies?.some((c) => !c.confirmed)) {
+    notes.push('Some SEC matches are companies whose filings merely mention this number — an agent, a counterparty or an acquisition target. Only entries marked as filed are the company\'s own number.');
+  }
+  if (search) {
+    notes.push('Search results are ranked by a search engine, not verified. Reverse-lookup spam sites dominate results for phone numbers and are filtered out of the name candidates, but read the sources before relying on any of them.');
+  }
+  if (!search) {
+    notes.push('Search-engine footprint is off. Setting BRAVE_SEARCH_API_KEY enables it, and it is the single highest-yield technique for putting a name to a business number.');
+  }
+  if (!live && !osm?.matched && !sec?.matched) {
+    notes.push('No name was found in any free source. These cover mapped businesses, US public companies and web presence — never private individuals, for whom no free authoritative source exists. Twilio credentials enable CNAM caller-ID lookup, which is billed per query.');
   }
   return notes;
 }
 
-function assess(phone, valid, type, carrier, live, osm) {
+function assess(phone, valid, type, carrier, live, osm, sec) {
   const findings = [];
 
   if (!valid) {
@@ -355,6 +609,24 @@ function assess(phone, valid, type, carrier, live, osm) {
       detail: [first.category, first.address].filter(Boolean).join(' · ')
         + (osm.places.length > 1 ? ` — and ${osm.places.length - 1} other mapped location(s) share this number.` : ''),
     });
+  }
+
+  if (sec?.matched) {
+    const filed = sec.companies.find((c) => c.confirmed);
+    if (filed) {
+      findings.push({
+        level: 'ok',
+        title: `Filed with the SEC by ${filed.name}`,
+        detail: [filed.industry, filed.location].filter(Boolean).join(' · ')
+          + ` — this number is on ${filed.name}'s EDGAR profile, so the attribution is the company's own filing.`,
+      });
+    } else {
+      findings.push({
+        level: 'info',
+        title: `Appears in SEC filings by ${sec.companies[0].name}`,
+        detail: 'The number occurs in their filings but is not the number on their EDGAR profile, so it may belong to an agent or counterparty rather than the filer.',
+      });
+    }
   }
 
   if (live?.callerName) {
