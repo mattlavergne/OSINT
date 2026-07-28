@@ -26,6 +26,8 @@ export async function lookupDomain(input, env = {}) {
     headers: () => securityHeaders(domain.value),
     securityTxt: () => securityTxt(domain.value),
     archive: () => archiveHistory(domain.value),
+    scans: () => urlScan(domain.value),
+    lookalikes: () => lookalikes(apex),
     ...(env.VIRUSTOTAL_API_KEY
       ? { reputation: () => virusTotalDomain(domain.value, env.VIRUSTOTAL_API_KEY) }
       : {}),
@@ -51,6 +53,8 @@ export async function lookupDomain(input, env = {}) {
     page: data.headers?.page ?? null,
     securityTxt: data.securityTxt ?? null,
     archive: data.archive ?? null,
+    scans: data.scans ?? null,
+    lookalikes: data.lookalikes ?? null,
     identity: identity(data),
     reputation: data.reputation ?? null,
     assessment: assess(domain.value, data, hosts),
@@ -514,6 +518,99 @@ function detectCdn(headers) {
   return null;
 }
 
+/**
+ * urlscan.io scan history.
+ *
+ * Anyone can submit a URL to urlscan and the results are public, so for a
+ * domain of any interest there is usually a trail: when it was last scanned,
+ * what addresses it served from, and — most useful — the page title and
+ * technologies at the time. The search endpoint needs no key.
+ */
+async function urlScan(domain) {
+  const body = await getJson(
+    `https://urlscan.io/api/v1/search/?q=domain%3A${encodeURIComponent(domain)}&size=10`,
+    { source: 'urlscan.io', timeout: 8000 },
+  );
+
+  const results = (body.results ?? []).slice(0, 10).map((r) => ({
+    url: r.page?.url ?? null,
+    title: r.page?.title ?? null,
+    scannedAt: r.task?.time ? r.task.time.slice(0, 10) : null,
+    address: r.page?.ip ?? null,
+    server: r.page?.server ?? null,
+    country: r.page?.country ?? null,
+    tlsIssuer: r.page?.tlsIssuer ?? null,
+    screenshot: r.screenshot ?? null,
+    reportUrl: r.result ?? null,
+  }));
+
+  return {
+    total: body.total ?? results.length,
+    results,
+    // Addresses urlscan actually observed serving the site, which can differ
+    // from what it resolves to right now.
+    observedAddresses: [...new Set(results.map((r) => r.address).filter(Boolean))],
+  };
+}
+
+/**
+ * Lookalike domain detection.
+ *
+ * dnstwister generates the permutation set a phishing operator would work from
+ * — bitsquats, homoglyphs, transpositions, TLD swaps. The permutations alone
+ * are noise; what matters is which of them someone has actually registered, so
+ * a bounded, prioritised subset is resolved over the DNS path we already use.
+ *
+ * The cap is deliberate. Resolving all ~300 candidates would cost more
+ * subrequests than the whole rest of the report put together.
+ */
+const LOOKALIKE_RESOLVE_LIMIT = 6;
+
+async function lookalikes(domain) {
+  const hex = [...domain].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  const body = await getJson(`https://dnstwister.report/api/fuzz/${hex}`, {
+    source: 'dnstwister.report',
+    timeout: 6000,
+  });
+
+  const candidates = (body.fuzzy_domains ?? [])
+    .map((f) => ({ domain: f.domain, technique: f.fuzzer }))
+    .filter((c) => c.domain && c.domain !== domain);
+
+  // Techniques that produce the most convincing fakes go first, since only a
+  // handful get resolved.
+  const priority = ['Homoglyph', 'Transposition', 'Omission', 'Repetition', 'Replacement', 'Bitsquatting'];
+  const ranked = candidates.slice().sort((a, b) => {
+    const rank = (t) => {
+      const i = priority.findIndex((p) => (t ?? '').toLowerCase().includes(p.toLowerCase()));
+      return i === -1 ? priority.length : i;
+    };
+    return rank(a.technique) - rank(b.technique);
+  });
+
+  const checked = ranked.slice(0, LOOKALIKE_RESOLVE_LIMIT);
+  const settled = await Promise.allSettled(checked.map((c) => resolve(c.domain, 'A')));
+
+  const registered = [];
+  settled.forEach((outcome, i) => {
+    if (outcome.status === 'fulfilled' && outcome.value.records.length) {
+      registered.push({
+        domain: checked[i].domain,
+        technique: checked[i].technique,
+        addresses: outcome.value.records,
+      });
+    }
+  });
+
+  return {
+    generated: candidates.length,
+    checked: checked.length,
+    registered,
+    // Be explicit that a clean result only covers what was actually tested.
+    note: `${checked.length} of ${candidates.length} generated permutations were resolved.`,
+  };
+}
+
 async function virusTotalDomain(domain, key) {
   const body = await getJson(`https://www.virustotal.com/api/v3/domains/${encodeURIComponent(domain)}`, {
     source: 'virustotal.com',
@@ -705,6 +802,16 @@ function assess(domain, data, hosts) {
         detail: 'The domain was in use well before the registration on record, so it has been re-registered or transferred. Archived content may belong to a previous owner.',
       });
     }
+  }
+
+  const impostors = data.lookalikes?.registered ?? [];
+  if (impostors.length) {
+    findings.push({
+      level: 'warn',
+      title: `${impostors.length} lookalike domain${impostors.length === 1 ? '' : 's'} registered`,
+      detail: impostors.slice(0, 5).map((i) => `${i.domain} (${i.technique})`).join(', ')
+        + `. ${data.lookalikes.note} Registration alone is not proof of abuse, but these are the names a phishing operator would use.`,
+    });
   }
 
   const identified = data.headers?.page;

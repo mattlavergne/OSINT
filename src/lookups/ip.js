@@ -35,9 +35,16 @@ export async function lookupIp(input, env = {}) {
     exposure: () => shodanInternetDb(ip.value),
     routing: () => routing(ip.value),
     neighbours: () => reverseIp(ip.value),
+    threat: () => dshield(ip.value),
     ...(env.ABUSEIPDB_API_KEY ? { abuse: () => abuseIpDb(ip.value, env.ABUSEIPDB_API_KEY) } : {}),
     ...(env.VIRUSTOTAL_API_KEY ? { reputation: () => virusTotalIp(ip.value, env.VIRUSTOTAL_API_KEY) } : {}),
   });
+
+  // PeeringDB is keyed by ASN, so it can only run once routing or geolocation
+  // has told us which one. One extra round trip, not a whole second wave.
+  const asn = data.routing?.originAsns?.[0]?.asn ?? data.geo?.asn ?? null;
+  const network = asn ? await peeringDb(asn).catch(() => null) : null;
+  if (asn) sources.peeringDb = { ok: network !== null };
 
   return {
     query: { type: 'ip', value: ip.value, version: ip.version },
@@ -47,6 +54,8 @@ export async function lookupIp(input, env = {}) {
     registry: data.registry,
     reverseDns: data.ptr,
     routing: data.routing,
+    threat: data.threat,
+    network: network,
     hostedDomains: data.neighbours,
     exposure: data.exposure,
     abuse: data.abuse ?? null,
@@ -347,6 +356,83 @@ async function hackerTargetReverse(ip) {
 }
 hackerTargetReverse.sourceName = 'hackertarget.com';
 
+/**
+ * SANS Internet Storm Center.
+ *
+ * DShield aggregates firewall logs from thousands of sensors, so it answers
+ * "has this address been attacking people" without an API key — the signal
+ * AbuseIPDB provides only once you register. A null count means the sensors
+ * have simply never logged it, which is a clean result rather than an error.
+ */
+async function dshield(ip) {
+  const body = await getJson(`https://isc.sans.edu/api/ip/${encodeURIComponent(ip)}?json`, {
+    source: 'isc.sans.edu',
+    timeout: 8000,
+  });
+
+  const d = body.ip ?? {};
+  const attacks = d.attacks == null ? null : Number(d.attacks);
+
+  return {
+    seen: attacks != null,
+    // Distinct target networks that logged this address.
+    targets: attacks,
+    // Total records submitted for it.
+    records: d.count == null ? null : Number(d.count),
+    firstSeen: d.mindate ?? null,
+    lastSeen: d.maxdate ?? null,
+    network: d.asname ?? null,
+    cloudProvider: d.cloud ?? null,
+    threatFeeds: (d.threatfeeds && typeof d.threatfeeds === 'object')
+      ? Object.keys(d.threatfeeds).slice(0, 12)
+      : [],
+  };
+}
+
+/**
+ * PeeringDB, the operator-maintained registry of networks.
+ *
+ * Where RDAP gives the legal holder of a netblock, PeeringDB gives the network
+ * as its operators describe it: traffic volume, scope, peering policy, and a
+ * published NOC contact — often the most direct route to a human.
+ */
+async function peeringDb(asn) {
+  const number = String(asn).replace(/^AS/i, '');
+  if (!/^\d+$/.test(number)) throw new Error('No usable ASN for a PeeringDB lookup');
+
+  const body = await getJson(`https://www.peeringdb.com/api/net?asn=${number}`, {
+    source: 'peeringdb.com',
+    timeout: 9000,
+  });
+
+  const net = body.data?.[0];
+  if (!net) throw new Error(`PeeringDB has no record for AS${number}`);
+
+  return {
+    asn: `AS${number}`,
+    name: net.name ?? null,
+    alsoKnownAs: net.aka || null,
+    website: net.website || null,
+    // How the operator describes its own reach and volume. Optional fields —
+    // plenty of networks leave them blank.
+    trafficLevels: net.info_traffic || null,
+    scope: net.info_scope || null,
+    networkType: net.info_type || null,
+    ratios: net.info_ratio || null,
+    peeringPolicy: net.policy_general || null,
+    policyUrl: net.policy_url || null,
+    // Declared prefix counts and peering reach: a rough size indicator.
+    prefixesV4: net.info_prefixes4 ?? null,
+    prefixesV6: net.info_prefixes6 ?? null,
+    exchangeCount: net.ix_count ?? null,
+    facilityCount: net.fac_count ?? null,
+    // The IRR AS-SET is the authoritative list of what this network announces.
+    irrAsSet: net.irr_as_set || null,
+    lookingGlass: net.looking_glass || null,
+    peeringDbUrl: `https://www.peeringdb.com/net/${net.id}`,
+  };
+}
+
 async function abuseIpDb(ip, key) {
   const body = await getJson(
     `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(ip)}&maxAgeInDays=90`,
@@ -398,6 +484,24 @@ function assess(data) {
       level: 'info',
       title: 'Hosting or CDN infrastructure',
       detail: `Owned by ${data.geo?.organization ?? data.registry?.name}. Geolocation reflects the datacenter, not a user — treat the coordinates as meaningless for attribution.`,
+    });
+  }
+
+  if (data.threat?.seen && data.threat.targets > 0) {
+    const heavy = data.threat.targets > 100;
+    findings.push({
+      level: heavy ? 'danger' : 'warn',
+      title: `Logged attacking ${data.threat.targets.toLocaleString()} network(s)`,
+      detail: `SANS Internet Storm Center sensors recorded ${(data.threat.records ?? 0).toLocaleString()} events`
+        + (data.threat.lastSeen ? `, most recently ${data.threat.lastSeen}` : '')
+        + '. This is firewall-log evidence of scanning or attack traffic.',
+    });
+  }
+  if (data.threat?.threatFeeds?.length) {
+    findings.push({
+      level: 'danger',
+      title: `Listed on ${data.threat.threatFeeds.length} threat feed(s)`,
+      detail: data.threat.threatFeeds.join(', '),
     });
   }
 

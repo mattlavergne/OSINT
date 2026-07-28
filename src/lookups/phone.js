@@ -173,7 +173,7 @@ async function openStreetMap(phone) {
       const body = await getJson(endpoint, {
         source: new URL(endpoint).hostname,
         method: 'POST',
-        timeout: 14000,
+        timeout: 8000,
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: `data=${encodeURIComponent(query)}`,
       });
@@ -329,7 +329,7 @@ async function secEdgar(phone) {
     try {
       body = await getJson(
         `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(`"${spelling}"`)}`,
-        { source: 'efts.sec.gov', timeout: 10000 },
+        { source: 'efts.sec.gov', timeout: 8000 },
       );
     } catch {
       continue;

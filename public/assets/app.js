@@ -513,6 +513,34 @@ function renderIp(d) {
       ` : html`<p class="muted">No domains found resolving to this address.</p>`,
         { wide: d.hostedDomains.count > 12, count: d.hostedDomains.count }) : raw('')}
 
+      ${d.threat ? card('Attack history', d.threat.seen ? dl([
+        ['Networks attacked', html`<span class="pill ${d.threat.targets > 100 ? 'bad' : 'warn'}">${(d.threat.targets ?? 0).toLocaleString()}</span>`],
+        ['Events logged', (d.threat.records ?? 0).toLocaleString()],
+        ['First seen', formatDate(d.threat.firstSeen)],
+        ['Last seen', formatDate(d.threat.lastSeen)],
+        ['Threat feeds', d.threat.threatFeeds?.length
+          ? html`<div class="tags">${d.threat.threatFeeds.map((f) => html`<span class="tag bad">${f}</span>`)}</div>` : null],
+        ['Cloud provider', d.threat.cloudProvider],
+      ]) : html`<p class="muted">SANS Internet Storm Center sensors have never logged traffic from this address.</p>`,
+        { count: d.threat.seen ? d.threat.threatFeeds?.length || null : null }) : raw('')}
+
+      ${d.network ? card('Network operator', dl([
+        ['Name', d.network.name],
+        ['Also known as', d.network.alsoKnownAs],
+        ['Type', d.network.networkType],
+        ['Scope', d.network.scope],
+        ['Traffic', d.network.trafficLevels],
+        ['Traffic ratio', d.network.ratios],
+        ['IPv4 / IPv6 prefixes', d.network.prefixesV4 != null
+          ? `${d.network.prefixesV4.toLocaleString()} / ${(d.network.prefixesV6 ?? 0).toLocaleString()}` : null],
+        ['Exchanges / facilities', d.network.exchangeCount != null
+          ? `${d.network.exchangeCount} / ${d.network.facilityCount}` : null],
+        ['Peering policy', d.network.peeringPolicy],
+        ['IRR AS-SET', d.network.irrAsSet ? html`<span class="mono">${d.network.irrAsSet}</span>` : null],
+        ['Website', d.network.website ? html`<a href="${d.network.website}" target="_blank" rel="noopener noreferrer">${d.network.website}</a>` : null],
+        ['PeeringDB', html`<a href="${d.network.peeringDbUrl}" target="_blank" rel="noopener noreferrer">${d.network.asn}</a>`],
+      ])) : raw('')}
+
       ${d.abuse ? card('Abuse reports', dl([
         ['Confidence', html`<span class="pill ${d.abuse.confidenceScore >= 50 ? 'bad' : d.abuse.confidenceScore > 0 ? 'warn' : 'good'}">${d.abuse.confidenceScore}%</span>`],
         ['Reports (90d)', d.abuse.totalReports],
@@ -699,6 +727,37 @@ function renderDomain(d) {
         </table></div>
       `, { wide: true, count: d.certificates.totalCertificates }) : raw('')}
 
+      ${d.lookalikes ? card('Lookalike domains', d.lookalikes.registered.length ? html`
+        <div class="scroll"><table>
+          <thead><tr><th>Domain</th><th>Technique</th><th>Resolves to</th></tr></thead>
+          <tbody>${d.lookalikes.registered.map((l) => html`
+            <tr>
+              <td class="mono">${l.domain}</td>
+              <td>${l.technique}</td>
+              <td class="mono">${l.addresses.join(', ')}</td>
+            </tr>`)}</tbody>
+        </table></div>
+        <p class="note">${d.lookalikes.note} Registration alone is not proof of abuse, but these are the names a phishing
+          operator would reach for. Only a bounded subset is resolved, so a clean result is not a guarantee.</p>
+      ` : html`<p class="muted">None of the permutations checked are registered.</p>
+        <p class="note">${d.lookalikes.note}</p>`,
+        { wide: d.lookalikes.registered.length > 0, count: d.lookalikes.registered.length }) : raw('')}
+
+      ${d.scans?.results?.length ? card('urlscan.io history', html`
+        <div class="scroll"><table>
+          <thead><tr><th>Scanned</th><th>Title</th><th>Address</th><th>Server</th></tr></thead>
+          <tbody>${d.scans.results.map((r) => html`
+            <tr>
+              <td>${r.reportUrl ? html`<a href="${r.reportUrl}" target="_blank" rel="noopener noreferrer">${formatDate(r.scannedAt) ?? '—'}</a>` : formatDate(r.scannedAt) ?? '—'}</td>
+              <td>${r.title ?? '—'}</td>
+              <td class="mono">${r.address ?? '—'}</td>
+              <td>${r.server ?? '—'}</td>
+            </tr>`)}</tbody>
+        </table></div>
+        <p class="note">${d.scans.total} public scan(s) on record. Addresses observed here can differ from what the domain
+          resolves to now, which is useful for spotting infrastructure moves.</p>
+      `, { wide: true, count: d.scans.total }) : raw('')}
+
       ${d.httpHeaders ? card('HTTP response', dl([
         ['Status', d.httpHeaders.status],
         ['Final URL', d.httpHeaders.finalUrl],
@@ -834,6 +893,16 @@ function toMarkdown(d) {
       ['Open ports', d.exposure?.ports], ['Known CVEs', d.exposure?.vulnerabilities],
       ['Hostnames', d.exposure?.hostnames],
     ]);
+    section('Attack history', [
+      ['Networks attacked', d.threat?.targets], ['Events logged', d.threat?.records],
+      ['First seen', d.threat?.firstSeen], ['Last seen', d.threat?.lastSeen],
+      ['Threat feeds', d.threat?.threatFeeds],
+    ]);
+    section('Network operator', [
+      ['Name', d.network?.name], ['Type', d.network?.networkType],
+      ['Scope', d.network?.scope], ['Peering policy', d.network?.peeringPolicy],
+      ['IRR AS-SET', d.network?.irrAsSet],
+    ]);
   } else {
     section('Attribution', [
       ['Candidate names', d.identity?.names?.map((n) => `${n.value} (${n.source}, ${n.confidence} confidence)`)],
@@ -862,6 +931,11 @@ function toMarkdown(d) {
       ['A', d.dns?.A?.records], ['AAAA', d.dns?.AAAA?.records],
       ['NS', d.dns?.NS?.records], ['CAA', d.dns?.CAA?.records],
     ]);
+    if (d.lookalikes?.registered?.length) {
+      lines.push('## Registered lookalike domains', '',
+        ...d.lookalikes.registered.map((l) => `- ${l.domain} (${l.technique}) -> ${l.addresses.join(', ')}`),
+        '', `_${d.lookalikes.note}_`, '');
+    }
     if (d.subdomains?.length) {
       lines.push(`## Subdomains (${d.subdomains.length})`, '', ...d.subdomains.map((s) => `- ${s}`), '');
     }

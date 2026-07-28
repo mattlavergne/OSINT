@@ -52,6 +52,8 @@ Validity, location and carrier each carry a stated caveat, because all three are
 - **Contacts**: `security.txt` (RFC 9116), RDAP abuse contact, and addresses published in the page
 - **Linked social profiles** and **analytics IDs** (GA4, UA, GTM, Meta Pixel, Hotjar) — a shared measurement ID across sites is strong evidence of a common operator
 - **Archive history**: first and last Wayback capture, which exposes domains re-registered long after their content first appeared
+- **Lookalike domains**: typosquat permutations from dnstwister, with a bounded subset resolved to show which are actually registered — `github.com` surfaces `qithub.com` and a punycode homoglyph, both live
+- **urlscan.io history**: public scan record, page titles and the addresses urlscan actually observed serving the site, which can differ from what it resolves to now
 
 ### IP
 - Geolocation **with a precision label** (city / region / country) so coordinates are not mistaken for an address
@@ -60,6 +62,8 @@ Validity, location and carrier each carry a stated caveat, because all three are
 - Shodan **InternetDB** (free, keyless): open ports, known CVEs, observed hostnames, software CPEs
 - Hosting/CDN detection, which reframes what the geolocation actually means
 - **BGP routing** from RIPEstat: announced prefix, origin AS and holder, announcement status — who announces a prefix is harder to falsify than a geolocation record
+- **Attack history** from SANS ISC DShield: how many networks the address has been logged attacking, event counts, first/last seen and threat-feed listings — the signal AbuseIPDB gives you only after you register, here without a key
+- **Network operator profile** from PeeringDB: how the operator describes its own network — type, scope, peering policy, prefix counts, IRR AS-SET
 - **Co-hosted domains** on the same address, which names the operator on dedicated hosting and flags shared infrastructure when it is not
 - Non-routable input (RFC 1918, loopback, CGNAT, link-local) short-circuits with an explanation instead of four upstream errors
 
@@ -81,6 +85,10 @@ Every source below is free and **needs no API key**.
 | [RapidDNS](https://rapiddns.io/) → [HackerTarget](https://hackertarget.com/) | Reverse-IP co-hosted domains |
 | [HackerTarget](https://hackertarget.com/) | Passive DNS host search (one of three subdomain sources) |
 | [RIPEstat](https://stat.ripe.net/) | BGP prefix, origin AS and announcement status |
+| [SANS ISC DShield](https://isc.sans.edu/api/) | Firewall-log attack history and threat-feed listings |
+| [PeeringDB](https://www.peeringdb.com/) | Network operator profile: type, scope, peering policy, IRR AS-SET |
+| [urlscan.io](https://urlscan.io/) | Public scan history, observed addresses and page titles |
+| [dnstwister](https://dnstwister.report/) | Lookalike domain permutations for typosquat detection |
 | [archive.org](https://archive.org/help/wayback_api.php) | First and last archived capture |
 | The site's own HTML | Title, org name, copyright entity, contacts, social profiles, analytics IDs |
 | `/.well-known/security.txt` | Published security contact (RFC 9116) |
@@ -200,12 +208,14 @@ The strip is conditional, so the same build also works unprefixed on a `*.worker
 | Limit | Free plan | What this app uses |
 |---|---|---|
 | Worker requests | 100,000/day | one per lookup, plus one per static asset |
-| Subrequests per request | 50 | measured 6 (IP), 29 (domain, worst case), 0 (phone) |
+| Subrequests per request | 50 | measured 9 (IP), 31 (domain), 5 (phone) |
 | CPU time per request | 10 ms | lookups are I/O-bound, not CPU-bound |
 | Static asset requests | free, not billed as requests | — |
 | Worker bundle size | 3 MB compressed | code only; the ~8 MB of phone data is assets, not bundle |
 
-The subrequest ceiling is the one to watch: a domain lookup with several resolved addresses measured 29, and redirect hops plus DoH fallbacks push that higher. If you ever see `Too many subrequests`, lower the address-enrichment cap in `src/lookups/domain.js` (`.slice(0, 4)`) to `2`.
+The subrequest ceiling is the one to watch: a domain lookup measured 31, and redirect hops plus DoH fallbacks push that higher. If you ever see `Too many subrequests`, the two biggest consumers are the lookalike resolver (`LOOKALIKE_RESOLVE_LIMIT` in `src/lookups/domain.js`) and the address-enrichment cap (`.slice(0, 4)` in the same file).
+
+Latency matters as much as the ceiling. Every source runs concurrently, so a report costs roughly its slowest source, and each has an individual timeout chosen with that in mind. A domain report typically returns in about 3 seconds and an IP report in under 7.
 
 ### Alternative: a subdomain instead of a path
 
@@ -271,6 +281,20 @@ Three decisions worth explaining:
 **Per-source isolation.** Every lookup runs its sub-queries concurrently under `Promise.allSettled` with individual timeouts. crt.sh times out on large domains routinely; that must degrade one panel, not the report.
 
 **Provider chains, because shared egress breaks per-IP quotas.** On Workers the outbound source address is Cloudflare's, shared with every other customer, so any free API that meters per IP is effectively pre-exhausted before your request arrives. In production this showed up as ipwho.is returning 429, HackerTarget reporting its daily quota spent, and rdap.org — itself behind Cloudflare — failing the Worker-to-Cloudflare TLS handshake with 525. Geolocation, reverse-IP and RDAP therefore each run an ordered chain of independent providers and take the first success, and the answering provider is reported in the payload so a degraded result is visible rather than silent. Prefer unmetered infrastructure endpoints (RIPEstat, IANA, DoH resolvers, Shodan InternetDB) over commercial free tiers wherever both will do.
+
+---
+
+## What was considered and rejected
+
+The [OSINT Framework](https://osintframework.com/) is the standard directory here, with 1,168 entries. Almost all of them are **web UIs for a human to type into**, not APIs — its Telephone Numbers branch is 22 links of which the queryable ones are Truecaller, Whitepages and similar, all of which prohibit automated access. Everything in it that is both free and machine-queryable has been folded in above. Specifically checked and rejected:
+
+| Source | Why not |
+|---|---|
+| OpenCNAM | Free tier withdrawn; returns 401 without credentials |
+| Numspy-Api | Endpoint dead (404) |
+| ThreatMiner | API returns 500 |
+| Whitepages / Spokeo / BeenVerified / Truecaller | Paid, and terms prohibit automated access |
+| DuckDuckGo HTML, SearxNG public instances | Serve a bot challenge or captcha to datacenter addresses |
 
 ---
 
