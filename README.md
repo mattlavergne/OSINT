@@ -70,13 +70,15 @@ Every source below is free and **needs no API key**.
 
 | Source | Used for |
 |---|---|
-| [ipwho.is](https://ipwho.is) | IP geolocation, ASN, ISP |
-| [rdap.org](https://rdap.org) | Domain and IP registration (RDAP bootstrap) |
+| [ipwho.is](https://ipwho.is) → [ip-api.com](https://ip-api.com) → [RIPEstat](https://stat.ripe.net/) | IP geolocation, tried in that order |
+| [IANA RDAP bootstrap](https://data.iana.org/rdap/) | Authoritative RDAP server per address range and TLD |
+| [rdap.org](https://rdap.org) | RDAP redirector, used only as a fallback |
 | [Cloudflare DoH](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/) / [Google DoH](https://developers.google.com/speed/public-dns/docs/doh) | All DNS resolution |
 | [Shodan InternetDB](https://internetdb.shodan.io) | Open ports, CVEs, hostnames |
 | [Cert Spotter](https://sslmate.com/ct_search_api/) | Certificate Transparency (fast) |
 | [crt.sh](https://crt.sh) | Certificate Transparency (deep history) |
-| [HackerTarget](https://hackertarget.com/) | Passive DNS host search, reverse-IP co-hosting |
+| [RapidDNS](https://rapiddns.io/) → [HackerTarget](https://hackertarget.com/) | Reverse-IP co-hosted domains |
+| [HackerTarget](https://hackertarget.com/) | Passive DNS host search (one of three subdomain sources) |
 | [RIPEstat](https://stat.ripe.net/) | BGP prefix, origin AS and announcement status |
 | [archive.org](https://archive.org/help/wayback_api.php) | First and last archived capture |
 | The site's own HTML | Title, org name, copyright entity, contacts, social profiles, analytics IDs |
@@ -258,6 +260,8 @@ Three decisions worth explaining:
 **Phone reference data as static assets.** `libphonenumber-geo-carrier` reads its BSON with `fs` and `__dirname`, so it cannot run on Workers at all. `npm run build` converts it to JSON sharded by calling code, served as static files and fetched on demand — a UK lookup pulls a 20 KB shard, and China's 4 MB shard is only ever touched by Chinese numbers. Keeps ~15 MB out of the Worker bundle and gives both runtimes identical behaviour.
 
 **Per-source isolation.** Every lookup runs its sub-queries concurrently under `Promise.allSettled` with individual timeouts. crt.sh times out on large domains routinely; that must degrade one panel, not the report.
+
+**Provider chains, because shared egress breaks per-IP quotas.** On Workers the outbound source address is Cloudflare's, shared with every other customer, so any free API that meters per IP is effectively pre-exhausted before your request arrives. In production this showed up as ipwho.is returning 429, HackerTarget reporting its daily quota spent, and rdap.org — itself behind Cloudflare — failing the Worker-to-Cloudflare TLS handshake with 525. Geolocation, reverse-IP and RDAP therefore each run an ordered chain of independent providers and take the first success, and the answering provider is reported in the payload so a degraded result is visible rather than silent. Prefer unmetered infrastructure endpoints (RIPEstat, IANA, DoH resolvers, Shodan InternetDB) over commercial free tiers wherever both will do.
 
 ---
 

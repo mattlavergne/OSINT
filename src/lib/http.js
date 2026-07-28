@@ -28,7 +28,10 @@ export class SourceError extends Error {
  *          accept?: string, method?: string, body?: string}} opts
  */
 export async function request(url, opts) {
-  const { source, timeout = DEFAULT_TIMEOUT_MS, headers = {}, accept, method = 'GET', body } = opts;
+  const {
+    source, timeout = DEFAULT_TIMEOUT_MS, headers = {}, accept,
+    method = 'GET', body, cacheTtl,
+  } = opts;
 
   let response;
   try {
@@ -37,6 +40,9 @@ export async function request(url, opts) {
       body,
       redirect: 'follow',
       signal: AbortSignal.timeout(timeout),
+      // Cloudflare-specific; ignored by Node's fetch. Used for small static
+      // reference data shared across every lookup, such as IANA bootstrap.
+      ...(cacheTtl ? { cf: { cacheTtl, cacheEverything: true } } : {}),
       headers: {
         'user-agent': USER_AGENT,
         ...(accept ? { accept } : {}),

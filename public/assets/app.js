@@ -389,7 +389,10 @@ function renderIp(d) {
         ['Region', geo.region],
         ['City', geo.city],
         ['Postal', geo.postal],
-        ['Precision', html`<span class="pill warn">${geo.precision}-level</span>`],
+        // Nested as one template: concatenating a Safe with a string collapses
+        // it to plain text, which then gets escaped on the way out.
+        ['Precision', html`<span class="pill warn">${geo.precision}-level</span>${
+          geo.provider ? html` <span class="muted">via ${geo.provider}</span>` : ''}`],
         ['Timezone', geo.timezone ? `${geo.timezone.id} (UTC${geo.timezone.utcOffset})` : null],
         ['Coordinates', geo.mapUrl
           ? html`<a href="${geo.mapUrl}" target="_blank" rel="noopener noreferrer">${geo.latitude}, ${geo.longitude}</a>`
@@ -454,6 +457,7 @@ function renderIp(d) {
             ? 'Shared hosting or a CDN front — this address does not identify a single owner.'
             : 'Few names resolve here, which suggests dedicated hosting.'}
           ${d.hostedDomains.truncated ? ' Showing the first 100.' : ''}
+          ${d.hostedDomains.provider ? ` Source: ${d.hostedDomains.provider}.` : ''}
         </p>
       ` : html`<p class="muted">No domains found resolving to this address.</p>`,
         { wide: d.hostedDomains.count > 12, count: d.hostedDomains.count }) : raw('')}
