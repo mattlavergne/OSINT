@@ -1,0 +1,13 @@
+name = "ghosttrace"
+pages_build_output_dir = "public"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Optional enrichment keys. Set them with:
+#   wrangler pages secret put SHODAN_API_KEY
+#   wrangler pages secret put VIRUSTOTAL_API_KEY
+#   wrangler pages secret put ABUSEIPDB_API_KEY
+# Everything works without them; keyed panels simply stay hidden.
+
+[vars]
+GHOSTTRACE_ENV = "production"

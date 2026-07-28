@@ -1,0 +1,11 @@
+# Copy to .dev.vars for local `wrangler pages dev`, or export as env vars for the Node server.
+# All three are OPTIONAL. GhostTrace is fully functional without any of them.
+
+# https://account.shodan.io/  -> unlocks banner/vuln detail beyond the free InternetDB
+SHODAN_API_KEY=
+
+# https://www.virustotal.com/gui/my-apikey  -> unlocks reputation scoring for domains and IPs
+VIRUSTOTAL_API_KEY=
+
+# https://www.abuseipdb.com/account/api  -> unlocks abuse confidence score for IPs
+ABUSEIPDB_API_KEY=

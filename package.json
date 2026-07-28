@@ -1,0 +1,27 @@
+{
+  "name": "ghosttrace",
+  "version": "1.0.0",
+  "description": "A modern OSINT reconnaissance console for phone numbers, domains and IP addresses. Spiritual successor to GhostTrack.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build-phone-data.mjs",
+    "dev": "npm run build && wrangler pages dev public --compatibility-date=2026-07-01",
+    "dev:node": "npm run build && node server/index.mjs",
+    "deploy": "npm run build && wrangler pages deploy public",
+    "pretest": "npm run build",
+    "test": "node --test 'test/*.test.mjs'",
+    "test:live": "GHOSTTRACE_LIVE=1 node --test 'test/*.test.mjs'"
+  },
+  "dependencies": {
+    "libphonenumber-js": "1.12.31"
+  },
+  "devDependencies": {
+    "bson": "^7.3.1",
+    "libphonenumber-geo-carrier": "^2.0.0",
+    "wrangler": "^4.0.0"
+  }
+}
