@@ -71,13 +71,18 @@ export async function lookupPhone(input, region, loadData, env = {}) {
 
   const type = phone.getType() ?? null;
 
-  // The only legitimate route to a subscriber or business name is CNAM, the
-  // carrier caller-ID database, which is metered. Everything else offering
-  // "phone to name" for free is a data broker or a scraper. Optional by design:
-  // without credentials the lookup simply omits this block.
-  const live = env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
-    ? await twilioLookup(phone.format('E.164'), env).catch((err) => ({ error: err.message }))
-    : null;
+  // Two name sources, run together:
+  //  - OpenStreetMap: free and keyless, but only ever covers mapped businesses
+  //    and public POIs. Never individuals.
+  //  - Twilio CNAM: the carrier caller-ID database. Metered, and the only
+  //    source that can name a subscriber.
+  const [places, live] = await Promise.all([
+    valid ? openStreetMap(phone).catch((err) => ({ error: err.message })) : null,
+    env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
+      ? twilioLookup(phone.format('E.164'), env).catch((err) => ({ error: err.message }))
+      : null,
+  ]);
+  const osm = places && !places.error ? places : null;
 
   return {
     query: { type: 'phone', value, region: hintRegion ?? null },
@@ -101,18 +106,111 @@ export async function lookupPhone(input, region, loadData, env = {}) {
     // Live, metered enrichment. Null unless Twilio credentials are configured.
     identity: live && !live.error ? live : null,
     identityError: live?.error ?? null,
+    // Free, keyless business attribution from OpenStreetMap.
+    places: osm?.places ?? [],
     timezones: Array.isArray(timezones) ? timezones : timezones ? [timezones] : [],
     localTime: localTimes(Array.isArray(timezones) ? timezones : []),
-    caveats: caveats(valid, geo, carrier, type, live && !live.error ? live : null),
+    caveats: caveats(valid, geo, carrier, type, live && !live.error ? live : null, osm),
     example: exampleFor(phone.country),
-    assessment: assess(phone, valid, type, carrier, live && !live.error ? live : null),
+    assessment: assess(phone, valid, type, carrier, live && !live.error ? live : null, osm),
     pivots: pivots(phone.format('E.164')),
     sources: {
       libphonenumber: { ok: true },
       referenceData: { ok: geo !== undefined || carrier !== undefined },
+      ...(places ? { openStreetMap: places.error ? { ok: false, error: places.error } : { ok: true } } : {}),
       ...(live ? { twilioLookup: live.error ? { ok: false, error: live.error } : { ok: true } } : {}),
     },
   };
+}
+
+/* --------------------------------------------------------- open-data lookup */
+
+/** Overpass mirrors, tried in order. The main instance is often busy. */
+const OVERPASS_MIRRORS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+];
+
+/**
+ * Reverse-lookup a phone number against OpenStreetMap.
+ *
+ * This is a genuinely free, keyless way to put a *name* to a number — the
+ * catch is that it only covers businesses and public POIs that someone has
+ * mapped, never individuals. When it hits, it is high quality: the operator
+ * published the number themselves and the data is open (ODbL).
+ *
+ * OSM stores phone numbers as free text with wildly inconsistent punctuation,
+ * and a planet-wide regex scan times out. So we generate the plausible
+ * spellings from libphonenumber's own formatters and union exact matches,
+ * which Overpass can serve off its value index in a couple of seconds.
+ */
+async function openStreetMap(phone) {
+  const variants = phoneSpellings(phone);
+  const clauses = variants
+    .flatMap((v) => [`nwr["phone"="${v}"];`, `nwr["contact:phone"="${v}"];`])
+    .join('');
+  const query = `[out:json][timeout:20];(${clauses});out center tags;`;
+
+  let lastError;
+  for (const endpoint of OVERPASS_MIRRORS) {
+    try {
+      const body = await getJson(endpoint, {
+        source: new URL(endpoint).hostname,
+        method: 'POST',
+        timeout: 14000,
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: `data=${encodeURIComponent(query)}`,
+      });
+
+      const places = (body.elements ?? [])
+        .filter((e) => e.tags?.name)
+        .map((e) => ({
+          name: e.tags.name,
+          category: e.tags.amenity ?? e.tags.shop ?? e.tags.office ?? e.tags.tourism ?? e.tags.healthcare ?? null,
+          operator: e.tags.operator ?? null,
+          brand: e.tags.brand ?? null,
+          address: [e.tags['addr:housenumber'], e.tags['addr:street'], e.tags['addr:city'], e.tags['addr:postcode']]
+            .filter(Boolean).join(' ') || null,
+          website: e.tags.website ?? e.tags['contact:website'] ?? null,
+          phone: e.tags.phone ?? e.tags['contact:phone'] ?? null,
+          osmUrl: `https://www.openstreetmap.org/${e.type}/${e.id}`,
+        }))
+        .slice(0, 10);
+
+      return { matched: places.length > 0, places };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError ?? new Error('No Overpass mirror responded');
+}
+
+/**
+ * Plausible written forms of a number, derived from libphonenumber's canonical
+ * formats rather than hardcoded per-country patterns.
+ */
+function phoneSpellings(phone) {
+  const intl = phone.formatInternational();       // "+1 212 343 3355"
+  const national = phone.formatNational();        // "(212) 343-3355"
+  const e164 = phone.format('E.164');             // "+12123433355"
+  const cc = `+${phone.countryCallingCode}`;
+
+  // "+1 212 343 3355" -> "+1 212-343-3355": keep the space after the calling
+  // code, hyphenate the rest. This is the single most common OSM spelling.
+  const firstSpace = intl.indexOf(' ');
+  const mixed = firstSpace === -1
+    ? intl
+    : intl.slice(0, firstSpace + 1) + intl.slice(firstSpace + 1).replace(/ /g, '-');
+
+  return [...new Set([
+    intl,
+    mixed,
+    intl.replace(/ /g, '-'),
+    e164,
+    national,
+    `${cc} ${national}`,
+    national.replace(/[()]/g, '').replace(/\s+/g, '-'),
+  ])].filter(Boolean);
 }
 
 /* ----------------------------------------------------------- live enrichment */
@@ -193,7 +291,7 @@ function localTimes(zones) {
   });
 }
 
-function caveats(valid, geo, carrier, type, live) {
+function caveats(valid, geo, carrier, type, live, osm) {
   const notes = [];
   if (valid) {
     notes.push('Validity means the number matches the published numbering plan for its country. It does not mean the number is currently assigned or in service.');
@@ -213,13 +311,16 @@ function caveats(valid, geo, carrier, type, live) {
   if (live?.callerName) {
     notes.push('Caller ID names are supplied by the carrier and are not verified identity. They are frequently outdated, and for consumer lines often absent entirely.');
   }
-  if (!live) {
-    notes.push('No subscriber or business name is shown: no free data source provides one. Configure Twilio credentials to enable CNAM caller-ID lookup, which is the only authoritative source and is billed per query.');
+  if (osm?.matched) {
+    notes.push('The OpenStreetMap match is community-contributed and may be out of date or refer to a previous occupant of the premises. Treat it as a lead to confirm, not a fact.');
+  }
+  if (!live && !osm?.matched) {
+    notes.push('No name was found. OpenStreetMap only covers mapped businesses and public places, never individuals, and no free source exists for subscriber names. Configuring Twilio credentials enables CNAM caller-ID lookup, which is the only authoritative name source and is billed per query.');
   }
   return notes;
 }
 
-function assess(phone, valid, type, carrier, live) {
+function assess(phone, valid, type, carrier, live, osm) {
   const findings = [];
 
   if (!valid) {
@@ -244,6 +345,16 @@ function assess(phone, valid, type, carrier, live) {
   }
   if (carrier) {
     findings.push({ level: 'info', title: `Allocated to ${carrier}`, detail: 'Original range holder. Verify against portability data before relying on this.' });
+  }
+
+  if (osm?.matched) {
+    const first = osm.places[0];
+    findings.push({
+      level: 'ok',
+      title: `Listed in OpenStreetMap as ${first.name}`,
+      detail: [first.category, first.address].filter(Boolean).join(' · ')
+        + (osm.places.length > 1 ? ` — and ${osm.places.length - 1} other mapped location(s) share this number.` : ''),
+    });
   }
 
   if (live?.callerName) {

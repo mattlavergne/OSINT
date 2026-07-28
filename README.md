@@ -81,6 +81,7 @@ Every source below is free and **needs no API key**.
 | [archive.org](https://archive.org/help/wayback_api.php) | First and last archived capture |
 | The site's own HTML | Title, org name, copyright entity, contacts, social profiles, analytics IDs |
 | `/.well-known/security.txt` | Published security contact (RFC 9116) |
+| [OpenStreetMap Overpass](https://overpass-api.de/) | Reverse phone → business/POI name, address and website |
 | libphonenumber | Phone validation, geocoding, carrier, timezones |
 
 ### Optional enrichment
@@ -97,13 +98,21 @@ npx wrangler secret put TWILIO_AUTH_TOKEN
 
 For the Node server, set them as environment variables instead. See `.dev.vars.example`.
 
-### On getting a person's name from a phone number
+### On putting a name to a phone number
 
-There is no free source for this, and the tool does not pretend otherwise.
+The answer splits cleanly in two, and it is worth being precise about which half you are in.
 
-Truecaller and its equivalents have no public API and prohibit scraping; the services that do return names are paid data brokers. The one authoritative and lawful source is **CNAM**, the caller-ID database carriers maintain, which GhostTrace reads through Twilio Lookup when credentials are configured. Even then it is US-centric, usually returns a business rather than a person, and is frequently stale or empty for consumer mobile lines — the payload says so in its caveats rather than presenting it as identity.
+**Businesses and public places — yes, free.** GhostTrace reverse-queries **OpenStreetMap** via Overpass. Where a business has been mapped with its phone number, this returns the name, category, brand, street address, website and a link to the OSM record. `+1 212-343-3355` resolves to Hard Rock Cafe, 1501 Broadway, with its website. It is open data (ODbL), keyless, and the operator published the number themselves. Coverage is the limitation, not licensing: it hits for mapped businesses and misses everything else.
 
-What *is* freely available for a phone number is the numbering-plan data already shown: validity, line type, allocation area, the originally allocated carrier, and timezones. Twilio additionally resolves the *current* carrier after number portability, which the bundled static dataset structurally cannot.
+**Individuals — no free source exists.** This is not a gap in the implementation:
+
+- Truecaller, Sync.me and Eyecon have no public API and prohibit scraping. The GitHub wrappers around Truecaller's mobile endpoints work by registering a handset and replaying its installation token, which violates their terms.
+- The services that reliably return a subscriber name are data brokers (Whitepages, Spokeo, BeenVerified, Intelius). They are paid, and much of their corpus is the digitised residential white pages — which is exactly why it is no longer free.
+- [PhoneInfoga](https://github.com/sundowndev/phoneinfoga), the best-known OSINT phone tool, does not return names either. It returns country, carrier and line type, then *generates search-engine dork URLs* for a human to follow. It is also now unmaintained. GhostTrace builds the same pivot links.
+
+The one authoritative, lawful route to a subscriber name is **CNAM**, the caller-ID database carriers maintain, wired in here as optional Twilio credentials. Even that is US-centric, usually returns a business, and is frequently stale or empty for consumer mobile lines.
+
+**Why the old phone book is not an API.** Residential white pages listed landline subscribers, and mobile numbers were never in them — no directory-listing obligation ever attached to mobile. As landlines collapsed and personal numbers went mobile, the directory stopped describing people. The digitised historical listings became the seed corpus of the data-broker industry rather than a public archive, and CCPA/CPRA and GDPR now force deletion and opt-out on what remains. Scanned directories survive in the Internet Archive, but as page images with inconsistent OCR — not queryable by number.
 
 ---
 

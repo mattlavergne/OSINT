@@ -328,6 +328,24 @@ function renderPhone(d) {
         ['Example for region', d.example ? html`<span class="mono muted">${d.example}</span>` : null],
       ]))}
 
+      ${d.places?.length ? card('Matched in OpenStreetMap', html`
+        ${d.places.map((pl) => html`
+          <h4 class="rrtype">${pl.name}${pl.category ? html` <span class="pill">${pl.category}</span>` : ''}</h4>
+          ${dl([
+            ['Brand', pl.brand],
+            ['Operator', pl.operator],
+            ['Address', pl.address],
+            ['Website', pl.website ? html`<a href="${pl.website}" target="_blank" rel="noopener noreferrer">${pl.website}</a>` : null],
+            ['Listed number', html`<span class="mono">${pl.phone}</span>`],
+            ['OSM record', html`<a href="${pl.osmUrl}" target="_blank" rel="noopener noreferrer">view</a>`],
+          ])}
+        `)}
+        <p class="note">
+          Community-contributed open data. It covers mapped businesses and public places only —
+          never individuals — and may be out of date or refer to a previous occupant.
+        </p>
+      `, { wide: true, count: d.places.length }) : raw('')}
+
       ${d.identity ? card('Caller identity', dl([
         ['Caller name', d.identity.callerName
           ? html`<strong>${d.identity.callerName}</strong>` : html`<span class="muted">no CNAM listing</span>`],
@@ -716,6 +734,10 @@ function toMarkdown(d) {
       ['E.164', d.formats?.e164], ['Allocated area', d.location], ['Carrier', d.carrier],
       ['Timezones', d.timezones],
     ]);
+    if (d.places?.length) {
+      lines.push('## OpenStreetMap matches', '',
+        ...d.places.map((pl) => `- **${pl.name}**${pl.category ? ` (${pl.category})` : ''}${pl.address ? ` — ${pl.address}` : ''}${pl.website ? ` — ${pl.website}` : ''}`), '');
+    }
     section('Caller identity (CNAM)', [
       ['Caller name', d.identity?.callerName], ['Listing type', d.identity?.callerType],
       ['Current carrier', d.identity?.currentCarrier], ['Current line type', d.identity?.currentLineType],
