@@ -52,7 +52,8 @@ describe('API contract', () => {
   });
 
   test('invalid input is a 400, not a 500', async () => {
-    for (const path of ['/api/ip?q=999.1.1.1', '/api/domain?q=localhost', '/api/phone?q=abc']) {
+    for (const path of ['/api/ip?q=999.1.1.1', '/api/domain?q=localhost', '/api/phone?q=abc',
+      '/api/email?q=nope', '/api/username?q=a', '/api/asn?q=AS-SET']) {
       const { status, body } = await call(path);
       assert.equal(status, 400, `${path} should be 400`);
       assert.equal(body.error, 'Invalid input');
@@ -64,6 +65,32 @@ describe('API contract', () => {
     assert.equal(status, 200);
     assert.equal(body.routable, false);
     assert.match(body.summary, /private/);
+  });
+
+  test('reserved AS numbers short-circuit without upstream calls', async () => {
+    const { status, body } = await call('/api/asn?q=AS64512');
+    assert.equal(status, 200);
+    assert.equal(body.public, false);
+    assert.match(body.summary, /private, reserved or documentation/);
+  });
+
+  test('every endpoint is listed on the index', async () => {
+    const { body } = await call('/api');
+    for (const route of ['ip', 'domain', 'phone', 'email', 'username', 'asn']) {
+      assert.ok(
+        Object.keys(body.endpoints).some((key) => key.includes(`/api/${route}`)),
+        `${route} should be documented on the index`,
+      );
+    }
+    // The depth switch changes what a lookup costs upstream, so it has to be
+    // discoverable from the API itself rather than only from the README.
+    assert.match(body.parameters.depth, /deep/i);
+  });
+
+  test('an unrecognised depth degrades to standard instead of erroring', async () => {
+    const { status, body } = await call('/api/ip?q=192.168.1.1&depth=nonsense');
+    assert.equal(status, 200);
+    assert.equal(body.routable, false);
   });
 });
 
@@ -97,6 +124,57 @@ describe('live lookups', { skip: live ? false : 'set GHOSTTRACE_LIVE=1 to run' }
     const { body } = await call('/api/domain?q=github.com');
     assert.ok(body.certificates.discoverySources.length >= 1);
     assert.ok(body.subdomains.length > 0);
+  });
+
+  test('email lookup classifies the address and reads mail posture', async () => {
+    const { status, body } = await call('/api/email?q=security@github.com');
+    assert.equal(status, 200);
+    assert.equal(body.address.domain, 'github.com');
+    assert.equal(body.classification.isRoleAccount, true);
+    assert.equal(body.mail.hasMx, true);
+    // Hashes are computed locally, so they must be present regardless of what
+    // any upstream did.
+    assert.match(body.address.sha256, /^[0-9a-f]{64}$/);
+    assert.match(body.address.md5, /^[0-9a-f]{32}$/);
+  });
+
+  test('username lookup separates found, absent and unavailable', async () => {
+    const { status, body } = await call('/api/username?q=torvalds');
+    assert.equal(status, 200);
+    assert.equal(
+      body.summary.found + body.summary.absent + body.summary.unavailable,
+      body.summary.checked,
+      'every platform checked must land in exactly one bucket',
+    );
+    // "Could not check" must never be reported as "no account" — that
+    // conflation is the reason the original username module was removed.
+    for (const entry of body.unavailable) assert.ok(entry.error);
+    for (const entry of body.notFound) assert.ok(entry.meaning);
+  });
+
+  test('ASN lookup returns a registry record and contact routes', async () => {
+    const { status, body } = await call('/api/asn?q=AS15169');
+    assert.equal(status, 200);
+    assert.equal(body.public, true);
+    assert.ok(body.registry.handle || body.profile?.name || body.overview?.holder);
+    assert.ok(Array.isArray(body.contacts));
+  });
+
+  test('a deep domain scan adds the enumeration passes', async () => {
+    const { status, body } = await call('/api/domain?q=github.com&depth=deep');
+    assert.equal(status, 200);
+    assert.equal(body.query.depth, 'deep');
+    // These only run on a deep scan; a standard scan leaves them null.
+    assert.ok(body.dkim, 'deep scan should attempt DKIM selector discovery');
+    assert.ok(body.services, 'deep scan should attempt SRV discovery');
+  });
+
+  test('favicon hashing produces the integer Shodan indexes', async () => {
+    const { body } = await call('/api/domain?q=github.com');
+    if (!body.favicon) return; // The site may not serve /favicon.ico.
+    assert.equal(typeof body.favicon.hash, 'number');
+    assert.ok(Number.isInteger(body.favicon.hash));
+    assert.match(body.favicon.shodanQuery, /^http\.favicon\.hash:-?\d+$/);
   });
 
   test('a partly-failed source degrades rather than failing the report', async () => {

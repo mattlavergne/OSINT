@@ -36,12 +36,25 @@ export async function resolve(name, type) {
         timeout: 6000,
       });
 
-      const answers = (body.Answer ?? []).filter((a) => a.type === TYPE_CODES[type]);
+      // Drop CNAME hops from the answer section so `records` only ever holds
+      // the type that was asked for. An unknown code means we have no numeric
+      // filter to apply, in which case everything is kept rather than silently
+      // discarded.
+      const code = TYPE_CODES[type];
+      const answers = code == null
+        ? (body.Answer ?? [])
+        : (body.Answer ?? []).filter((a) => a.type === code);
+
       return {
         type,
         status: RCODE[body.Status] ?? `RCODE_${body.Status}`,
         records: answers.map((a) => cleanRdata(type, a.data)),
         ttl: answers.length ? Math.min(...answers.map((a) => a.TTL)) : null,
+        // The chain of CNAMEs traversed to get here. Needed for takeover
+        // detection, where the *target* of the alias is the whole finding.
+        aliases: (body.Answer ?? [])
+          .filter((a) => a.type === TYPE_CODES.CNAME)
+          .map((a) => String(a.data).replace(/\.$/, '').toLowerCase()),
       };
     } catch (err) {
       lastError = err;
@@ -51,10 +64,17 @@ export async function resolve(name, type) {
   throw new SourceError('dns', `DNS lookup for ${type} failed: ${lastError?.message ?? 'unknown error'}`);
 }
 
-/** Numeric RR type codes, used to drop CNAME hops from the answer section. */
+/**
+ * Numeric RR type codes, used to drop CNAME hops from the answer section.
+ *
+ * DS and DNSKEY matter here beyond completeness: without their codes the filter
+ * above compares against `undefined` and throws away every answer, so a signed
+ * zone reports as having no DNSSEC records at all.
+ */
 const TYPE_CODES = {
   A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15,
-  TXT: 16, AAAA: 28, SRV: 33, CAA: 257,
+  TXT: 16, AAAA: 28, SRV: 33, DS: 43, DNSKEY: 48,
+  HTTPS: 65, CAA: 257,
 };
 
 /** Strip the quoting and trailing dots that DoH returns verbatim from the wire. */
@@ -67,10 +87,30 @@ function cleanRdata(type, data) {
   if (type === 'CAA') {
     value = decodeCaa(value);
   }
-  if (['NS', 'CNAME', 'PTR', 'MX', 'SOA'].includes(type)) {
+  if (['NS', 'CNAME', 'PTR', 'MX', 'SOA', 'SRV'].includes(type)) {
     value = value.replace(/\.$/, '').replace(/\.(\s)/g, '$1');
   }
   return value;
+}
+
+/**
+ * Resolve a batch of names for one record type, tolerating individual failures.
+ *
+ * Used wherever a lookup fans out over a generated name list — DKIM selectors,
+ * SRV service names, discovered subdomains, blocklist zones — where the
+ * interesting result is *which* of them answered.
+ *
+ * @returns {Promise<Array<{name: string, ok: boolean, records: string[], aliases: string[]}>>}
+ */
+export async function resolveBatch(names, type) {
+  const settled = await Promise.allSettled(names.map((name) => resolve(name, type)));
+  return settled.map((outcome, i) => ({
+    name: names[i],
+    ok: outcome.status === 'fulfilled',
+    records: outcome.status === 'fulfilled' ? outcome.value.records : [],
+    aliases: outcome.status === 'fulfilled' ? (outcome.value.aliases ?? []) : [],
+    status: outcome.status === 'fulfilled' ? outcome.value.status : 'ERROR',
+  }));
 }
 
 /**

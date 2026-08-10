@@ -167,6 +167,121 @@ export function parsePhoneInput(input, region) {
 }
 
 /**
+ * Validate an email address.
+ *
+ * Deliberately not RFC 5322-complete: the full grammar permits quoted local
+ * parts, comments and nested folding whitespace that no real mailbox uses and
+ * that no upstream here would accept. This checks the shape every deliverable
+ * address actually has, and reuses the domain grammar for the right-hand side
+ * so an address and a domain lookup agree on what a hostname is.
+ *
+ * @returns {{value: string, local: string, domain: string, tag: string|null,
+ *            canonical: string, labels: string[]}}
+ */
+export function parseEmail(input) {
+  const raw = String(input ?? '').trim().replace(/^mailto:/i, '');
+  if (!raw) throw new ValidationError('An email address is required.');
+  if (raw.length > 254) throw new ValidationError('Email addresses cannot exceed 254 characters.');
+
+  const at = raw.lastIndexOf('@');
+  if (at < 1 || at === raw.length - 1) {
+    throw new ValidationError(`"${input}" is not an email address — it needs a local part and a domain either side of an "@".`);
+  }
+
+  const local = raw.slice(0, at);
+  const domainPart = raw.slice(at + 1).toLowerCase();
+
+  if (local.length > 64) throw new ValidationError('The local part of an email address cannot exceed 64 characters.');
+  if (!/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(local)) {
+    throw new ValidationError(`"${local}" contains characters that are not valid in an email local part.`);
+  }
+  if (local.startsWith('.') || local.endsWith('.') || local.includes('..')) {
+    throw new ValidationError('The local part cannot start or end with a dot, or contain two in a row.');
+  }
+
+  const domain = parseDomain(domainPart);
+
+  // The sub-address tag ("+newsletter") is chosen per-signup, so it frequently
+  // records where the address was given out — worth isolating rather than
+  // discarding.
+  const plus = local.indexOf('+');
+  const tag = plus > 0 ? local.slice(plus + 1) : null;
+  const base = plus > 0 ? local.slice(0, plus) : local;
+
+  // Gmail ignores dots and everything after a "+", so several written forms are
+  // one mailbox. Canonicalising means a Gravatar or breach lookup finds the
+  // account even when the address was written in a variant spelling.
+  const gmail = domain.value === 'gmail.com' || domain.value === 'googlemail.com';
+  const canonical = gmail
+    ? `${base.replace(/\./g, '').toLowerCase()}@gmail.com`
+    : `${base.toLowerCase()}@${domain.value}`;
+
+  return {
+    value: `${local}@${domain.value}`,
+    local,
+    domain: domain.value,
+    labels: domain.labels,
+    tag,
+    canonical,
+  };
+}
+
+/**
+ * Validate a username / handle.
+ *
+ * The union of what the platforms checked will accept: letters, digits, and the
+ * three separators between them. Anything else is either a different kind of
+ * identifier or an injection attempt, and either way is not a username.
+ *
+ * @returns {{value: string}}
+ */
+export function parseUsername(input) {
+  let value = String(input ?? '').trim();
+  if (!value) throw new ValidationError('A username is required.');
+
+  // Accept the forms people paste: @handle, a profile URL, user@instance.
+  value = value.replace(/^@+/, '');
+  if (/^https?:\/\//i.test(value)) {
+    const path = value.replace(/^https?:\/\/[^/]+\//i, '').split(/[/?#]/)[0];
+    value = path.replace(/^@+/, '') || value;
+  }
+  value = value.split('@')[0];
+
+  if (value.length < 2) throw new ValidationError('Usernames must be at least 2 characters.');
+  if (value.length > 39) throw new ValidationError('That is longer than any of the platforms checked allow (39 characters).');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) {
+    throw new ValidationError('Usernames may only contain letters, digits, and the separators . _ and -, and must start with a letter or digit.');
+  }
+
+  return { value };
+}
+
+/**
+ * Validate an autonomous system number.
+ * Accepts "AS15169", "as15169", "15169" and the 32-bit range.
+ *
+ * @returns {{value: number, label: string}}
+ */
+export function parseAsn(input) {
+  const raw = String(input ?? '').trim().toUpperCase().replace(/^AS/, '');
+  if (!/^\d+$/.test(raw)) {
+    throw new ValidationError(`"${input}" is not an AS number. Use a form like AS15169 or 15169.`);
+  }
+
+  const value = Number(raw);
+  if (value < 0 || value > 4294967295) {
+    throw new ValidationError('AS numbers run from 0 to 4294967295.');
+  }
+  if (value === 0 || (value >= 64496 && value <= 65551) || (value >= 4200000000)) {
+    // Documentation and private ranges have no public registry record, so say
+    // why the lookup will be empty instead of returning four upstream errors.
+    return { value, label: `AS${value}`, reserved: true };
+  }
+
+  return { value, label: `AS${value}`, reserved: false };
+}
+
+/**
  * The registrable domain, best-effort without a full Public Suffix List.
  * Handles the common two-part public suffixes (co.uk, com.au, ...).
  */

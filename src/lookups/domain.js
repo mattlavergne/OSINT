@@ -2,63 +2,116 @@
  * Domain reconnaissance.
  *
  * This is the module GhostTrack never had. Everything here is passive: it reads
- * public registry data, public DNS and public Certificate Transparency logs.
- * The only packet sent to the target itself is one ordinary HTTPS GET to read
- * security headers — no scanning, no brute force, no bulk enumeration.
+ * public registry data, public DNS, public Certificate Transparency logs, and
+ * the files a site publishes at conventional public paths. The only packets
+ * sent to the target are ordinary HTTPS GETs of documents it serves to any
+ * browser — no scanning, no brute force, no bulk enumeration.
  */
 
-import { getJson, getText, request, gather } from '../lib/http.js';
-import { resolveMany, resolve } from '../lib/dns.js';
+import { getJson, getText, getBytes, requestChain, readCapped, gather } from '../lib/http.js';
+import { resolveMany, resolve, resolveBatch } from '../lib/dns.js';
 import { parseDomain, registrableDomain } from '../lib/validate.js';
+import { faviconHash } from '../lib/hash.js';
+import {
+  DKIM_SELECTORS, SRV_SERVICES, TAKEOVER_SIGNATURES, WELL_KNOWN_FILES,
+  fingerprint, mailProvider, dnsProvider,
+} from '../lib/providers.js';
 import * as rdap from '../lib/rdap.js';
 
 const RECORD_TYPES = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA', 'CAA', 'DS'];
 
-export async function lookupDomain(input, env = {}) {
+/**
+ * Subdomain names worth resolving first.
+ *
+ * Certificate Transparency routinely returns hundreds of names and only a
+ * bounded number can be resolved. Ranking matters more than the cap: these are
+ * the prefixes that sit in front of the interesting things — remote access,
+ * internal tooling, pre-production, and the un-fronted origin behind a CDN.
+ */
+const INTERESTING_PREFIXES = [
+  'vpn', 'remote', 'access', 'gateway', 'portal', 'sso', 'auth', 'login', 'idp',
+  'admin', 'manage', 'cpanel', 'webmail', 'mail', 'smtp', 'imap', 'exchange',
+  'dev', 'test', 'staging', 'stage', 'uat', 'qa', 'sandbox', 'preprod', 'beta',
+  'internal', 'intranet', 'corp', 'private', 'old', 'legacy', 'backup',
+  'api', 'git', 'gitlab', 'jenkins', 'ci', 'jira', 'confluence', 'grafana',
+  'kibana', 'prometheus', 'vault', 'db', 'database', 'sql', 'ftp', 'sftp',
+  'origin', 'direct', 'srv', 'server', 'host', 'ns', 'router', 'firewall',
+  'monitor', 'status', 'metrics', 'log', 'logs', 'proxy', 'cdn', 'static',
+];
+
+export async function lookupDomain(input, env = {}, options = {}) {
   const domain = parseDomain(input);
   const apex = registrableDomain(domain.labels);
+  const deep = options.depth === 'deep';
 
   const { data, sources } = await gather({
     registration: () => registration(apex),
     dns: () => resolveMany(domain.value, RECORD_TYPES),
     email: () => emailSecurity(domain.value),
     certificates: () => certificateTransparency(domain.value),
-    headers: () => securityHeaders(domain.value),
+    headers: () => siteResponse(domain.value),
     securityTxt: () => securityTxt(domain.value),
     archive: () => archiveHistory(domain.value),
     scans: () => urlScan(domain.value),
-    lookalikes: () => lookalikes(apex),
+    lookalikes: () => lookalikes(apex, deep ? 10 : 4),
+    publicFiles: () => wellKnownFiles(domain.value, deep),
+    favicon: () => faviconFingerprint(domain.value),
+    wildcard: () => wildcardCheck(domain.value),
+    ...(deep ? { dkim: () => dkimSelectors(domain.value) } : {}),
+    ...(deep ? { srv: () => srvServices(domain.value) } : {}),
+    ...(deep ? { dnskey: () => resolve(domain.value, 'DNSKEY') } : {}),
     ...(env.VIRUSTOTAL_API_KEY
       ? { reputation: () => virusTotalDomain(domain.value, env.VIRUSTOTAL_API_KEY) }
       : {}),
   });
 
-  // Enrich whatever the domain resolves to. Done after the first wave so we
-  // know the addresses; kept to the first few so one domain can't fan out.
+  // Second wave: everything that needs the first wave's answers.
   const addresses = [
     ...(data.dns?.A?.records ?? []),
     ...(data.dns?.AAAA?.records ?? []),
-  ].slice(0, 4);
-  const hosts = await enrichAddresses(addresses);
+  ].slice(0, deep ? 4 : 2);
+
+  const [hosts, subdomainDetail] = await Promise.all([
+    enrichAddresses(addresses),
+    deep
+      ? mapSubdomains(data.certificates?.subdomains ?? [], domain.value, addresses)
+      : null,
+  ]);
+  if (deep) sources.subdomainMap = { ok: subdomainDetail !== null };
+
+  const page = data.headers?.page ?? null;
 
   return {
-    query: { type: 'domain', value: domain.value, apex, isSubdomain: domain.value !== apex },
+    query: { type: 'domain', value: domain.value, apex, isSubdomain: domain.value !== apex, depth: options.depth ?? 'standard' },
     registration: data.registration,
     dns: formatDns(data.dns),
+    dnssec: dnssecPosture(data),
+    wildcard: data.wildcard ?? null,
+    providers: identifyProviders(data),
     hosting: hosts,
     email: data.email,
+    dkim: data.dkim ?? null,
+    services: data.srv ?? null,
     certificates: data.certificates,
     subdomains: data.certificates?.subdomains ?? [],
+    subdomainDetail,
+    // Other registrable domains that share a TLS certificate with this one.
+    relatedDomains: data.certificates?.relatedDomains ?? [],
     httpHeaders: data.headers,
-    page: data.headers?.page ?? null,
+    redirectChain: data.headers?.chain ?? null,
+    technologies: data.headers?.technologies ?? [],
+    page,
+    structuredData: page?.structuredData ?? null,
+    favicon: data.favicon ?? null,
+    publicFiles: data.publicFiles ?? null,
     securityTxt: data.securityTxt ?? null,
     archive: data.archive ?? null,
     scans: data.scans ?? null,
     lookalikes: data.lookalikes ?? null,
     identity: identity(data),
     reputation: data.reputation ?? null,
-    assessment: assess(domain.value, data, hosts),
-    pivots: pivots(domain.value),
+    assessment: assess(domain.value, data, hosts, subdomainDetail),
+    pivots: pivots(domain.value, data.favicon),
     sources,
   };
 }
@@ -80,9 +133,11 @@ async function registration(apex) {
     registrant: redactionAware(roles.registrant),
     administrative: redactionAware(roles.administrative),
     technical: redactionAware(roles.technical),
+    reseller: roles.reseller?.name ?? null,
     created,
     updated: rdap.eventDate(body.events, 'last changed'),
     expires,
+    transferred: rdap.eventDate(body.events, 'transfer'),
     ageDays: created ? daysBetween(created, Date.now()) : null,
     daysUntilExpiry: expires ? daysBetween(Date.now(), expires) : null,
     status: rdap.describeStatus(body.status),
@@ -132,6 +187,8 @@ async function emailSecurity(domain) {
     // Domain-verification and service TXT records are useful pivots: they show
     // which SaaS platforms the organisation uses.
     verifications: rootTxt.filter((r) => /verification|-site-verification|-domain-verification/i.test(r)),
+    // Every TXT record, so nothing is hidden behind the filters above.
+    allTxt: rootTxt.slice(0, 40),
   };
 }
 
@@ -144,6 +201,10 @@ function parseSpf(record) {
     // Each `include`/`redirect` costs a DNS lookup; SPF hard-fails past 10.
     includes: [...record.matchAll(/\binclude:([^\s]+)/gi)].map((m) => m[1]),
     lookupCount: (record.match(/\b(include|a|mx|ptr|exists|redirect)[:=]/gi) ?? []).length,
+    // Hardcoded senders are a direct list of the organisation's own mail
+    // infrastructure, which nothing else in DNS enumerates.
+    ipv4: [...record.matchAll(/\bip4:([^\s]+)/gi)].map((m) => m[1]),
+    ipv6: [...record.matchAll(/\bip6:([^\s]+)/gi)].map((m) => m[1]),
   };
 }
 
@@ -158,6 +219,121 @@ function parseDmarc(record) {
     forensicReports: tag('ruf'),
     alignment: { dkim: tag('adkim') ?? 'r', spf: tag('aspf') ?? 'r' },
     enforcing: policy === 'quarantine' || policy === 'reject',
+    // The reporting address often belongs to a third-party DMARC vendor, and
+    // sometimes to a different corporate domain — a genuine ownership link.
+    reportingDomains: [...new Set(
+      [tag('rua'), tag('ruf')].filter(Boolean).join(',')
+        .split(',')
+        .map((uri) => uri.trim().replace(/^mailto:/i, '').split('@')[1])
+        .filter(Boolean),
+    )],
+  };
+}
+
+/**
+ * DKIM selector discovery.
+ *
+ * DKIM keys live at `<selector>._domainkey.<domain>` and the selector is chosen
+ * by the sending platform, so the selectors that resolve are a direct list of
+ * every service authorised to send mail as this domain — including internal
+ * tools that appear nowhere else in DNS. There is no way to enumerate
+ * selectors; you check the conventional name each platform uses.
+ */
+async function dkimSelectors(domain) {
+  const candidates = DKIM_SELECTORS.slice(0, 16);
+  const results = await resolveBatch(
+    candidates.map((c) => `${c.selector}._domainkey.${domain}`),
+    'TXT',
+  );
+
+  const found = [];
+  results.forEach((result, i) => {
+    const record = result.records.find((r) => /v=DKIM1|[;\s]p=/i.test(r));
+    if (!record) return;
+
+    const keyType = record.match(/\bk=([a-z0-9]+)/i)?.[1] ?? 'rsa';
+    const key = record.match(/\bp=([A-Za-z0-9+/=]*)/)?.[1] ?? '';
+
+    found.push({
+      selector: candidates[i].selector,
+      platform: candidates[i].platform,
+      keyType,
+      // An empty p= is a revoked key: the selector existed and was retired,
+      // which still tells you the platform was once in use.
+      revoked: key.length === 0,
+      keyBits: key ? estimateKeyBits(key) : null,
+    });
+  });
+
+  return { checked: candidates.length, found, platforms: [...new Set(found.map((f) => f.platform))] };
+}
+
+/** Rough modulus size from a base64 DER public key, for weak-key detection. */
+function estimateKeyBits(base64Key) {
+  const bytes = Math.floor((base64Key.replace(/=+$/, '').length * 3) / 4);
+  if (bytes > 380) return 4096;
+  if (bytes > 240) return 2048;
+  if (bytes > 150) return 1024;
+  return 512;
+}
+
+/**
+ * SRV service discovery.
+ *
+ * Each SRV name that resolves maps a service the organisation runs and, in the
+ * record's target, the host that runs it — an internal collaboration stack that
+ * A and MX records never expose.
+ */
+async function srvServices(domain) {
+  const results = await resolveBatch(
+    SRV_SERVICES.map((s) => `${s.name}.${domain}`),
+    'SRV',
+  );
+
+  const found = [];
+  results.forEach((result, i) => {
+    for (const record of result.records) {
+      // priority weight port target
+      const [priority, weight, port, ...rest] = record.split(/\s+/);
+      const target = rest.join(' ').replace(/\.$/, '');
+      if (!target || target === '.') continue;
+
+      // `|| null` would discard a legitimate zero, and zero is the usual value
+      // for both SRV priority and weight.
+      const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
+
+      found.push({
+        service: SRV_SERVICES[i].label,
+        name: SRV_SERVICES[i].name,
+        target,
+        port: number(port),
+        priority: number(priority),
+        weight: number(weight),
+      });
+    }
+  });
+
+  return { checked: SRV_SERVICES.length, found };
+}
+
+/**
+ * Wildcard DNS detection.
+ *
+ * A zone that answers for every possible name makes subdomain enumeration
+ * meaningless — every guess "resolves". Detecting it costs one lookup of a name
+ * nobody would ever register, and it changes how the whole subdomain section
+ * should be read.
+ */
+async function wildcardCheck(domain) {
+  const probe = `gt-${Math.random().toString(36).slice(2, 12)}.${domain}`;
+  const result = await resolve(probe, 'A');
+  return {
+    wildcard: result.records.length > 0,
+    probe,
+    addresses: result.records,
+    note: result.records.length
+      ? 'This zone answers for names that do not exist, so a subdomain resolving is not evidence that it was ever configured.'
+      : 'Non-existent names correctly return NXDOMAIN, so resolution is meaningful.',
   };
 }
 
@@ -179,6 +355,7 @@ async function certificateTransparency(domain) {
   ]);
 
   const names = new Set();
+  const foreign = new Set();
   const contributing = [];
   const failed = [];
 
@@ -189,6 +366,8 @@ async function certificateTransparency(domain) {
   ]) {
     if (outcome.status === 'fulfilled') {
       outcome.value.names.forEach((n) => names.add(n));
+      // Names on the same certificate that sit outside this domain entirely.
+      outcome.value.foreign?.forEach((n) => foreign.add(n));
       contributing.push({ name: label, found: outcome.value.names.length });
     } else {
       failed.push({ name: label, error: outcome.reason?.message ?? String(outcome.reason) });
@@ -207,12 +386,20 @@ async function certificateTransparency(domain) {
   const issuers = {};
   for (const cert of certs) issuers[cert.issuer] = (issuers[cert.issuer] ?? 0) + 1;
 
+  // A certificate covering two unrelated domains is issued by whoever controls
+  // both — one of the strongest ownership links available from public logs.
+  const relatedDomains = [...foreign]
+    .map((name) => registrableDomain(name.split('.')))
+    .filter((name, i, all) => name !== domain && all.indexOf(name) === i)
+    .slice(0, 40);
+
   return {
     totalCertificates: certs.length,
     subdomains: [...names].sort(),
+    relatedDomains,
     recentCertificates: certs
       .sort((a, b) => new Date(b.validFrom) - new Date(a.validFrom))
-      .slice(0, 6),
+      .slice(0, 8),
     issuers: Object.entries(issuers)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 6)
@@ -232,12 +419,18 @@ async function certSpotter(domain) {
 
   const entries = Array.isArray(body) ? body : [];
   const names = new Set();
+  const foreign = new Set();
   const certificates = [];
 
   for (const entry of entries) {
-    for (const name of entry.dns_names ?? []) names.add(normalizeName(name, domain));
+    for (const name of entry.dns_names ?? []) {
+      const clean = normalizeName(name, domain);
+      if (clean) names.add(clean);
+      else collectForeign(name, domain, foreign);
+    }
     certificates.push({
       commonName: entry.dns_names?.[0] ?? null,
+      names: (entry.dns_names ?? []).slice(0, 12),
       issuer: entry.issuer?.friendly_name ?? shortIssuer(entry.issuer?.name),
       validFrom: entry.not_before ?? null,
       validTo: entry.not_after ?? null,
@@ -246,7 +439,7 @@ async function certSpotter(domain) {
     });
   }
 
-  return { names: [...names].filter(Boolean), certificates };
+  return { names: [...names].filter(Boolean), foreign: [...foreign], certificates };
 }
 
 /** crt.sh: deepest CT history, but slow — kept on a short leash. */
@@ -258,15 +451,19 @@ async function crtSh(domain) {
 
   const entries = Array.isArray(body) ? body : [];
   const names = new Set();
+  const foreign = new Set();
 
   for (const entry of entries) {
     for (const name of String(entry.name_value ?? '').split('\n')) {
-      names.add(normalizeName(name, domain));
+      const clean = normalizeName(name, domain);
+      if (clean) names.add(clean);
+      else collectForeign(name, domain, foreign);
     }
   }
 
   const certificates = entries.slice(0, 200).map((e) => ({
     commonName: e.common_name ?? null,
+    names: String(e.name_value ?? '').split('\n').slice(0, 12),
     issuer: shortIssuer(e.issuer_name),
     validFrom: e.not_before ?? null,
     validTo: e.not_after ?? null,
@@ -274,7 +471,7 @@ async function crtSh(domain) {
     source: 'crt.sh',
   }));
 
-  return { names: [...names].filter(Boolean), certificates };
+  return { names: [...names].filter(Boolean), foreign: [...foreign], certificates };
 }
 
 /** HackerTarget hostsearch: names that resolve now, from passive DNS. */
@@ -294,7 +491,7 @@ async function hackerTarget(domain) {
     .map((line) => normalizeName(line.split(',')[0] ?? '', domain))
     .filter(Boolean);
 
-  return { names: [...new Set(names)], certificates: [] };
+  return { names: [...new Set(names)], foreign: [], certificates: [] };
 }
 
 /** Lower-case, de-wildcard, and reject anything outside the queried domain. */
@@ -304,21 +501,32 @@ function normalizeName(name, domain) {
   return clean;
 }
 
+/** Names on the certificate belonging to some *other* domain entirely. */
+function collectForeign(name, domain, into) {
+  const clean = String(name).trim().toLowerCase().replace(/^\*\./, '').replace(/\.$/, '');
+  if (!clean || clean.includes(' ') || !clean.includes('.')) return;
+  if (clean.endsWith(domain)) return;
+  if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(clean)) return;
+  into.add(clean);
+}
+
 function shortIssuer(issuerName = '') {
   return issuerName?.match(/O\s*=\s*"?([^,"]+)/)?.[1]?.trim() ?? String(issuerName).slice(0, 60);
 }
 
 /**
- * One plain HTTPS GET of the site root, read twice over: for the security
- * header posture, and for what the page itself discloses.
+ * One HTTPS GET of the site root, read for everything it will give up: the
+ * redirect route, the security header posture, the technology stack, and what
+ * the page itself discloses.
  *
  * The HTML is the single richest attribution source in a domain lookup — the
- * organisation usually names itself in the title, og:site_name or copyright
- * line, and the analytics IDs embedded in the page are a strong ownership
- * pivot. All of it comes from a request we were already making.
+ * organisation usually names itself in the title, og:site_name, its JSON-LD
+ * block or its copyright line, and the analytics and service IDs embedded in
+ * the page are a strong ownership pivot. All of it comes from a request we were
+ * already making.
  */
-async function securityHeaders(domain) {
-  const response = await request(`https://${domain}/`, {
+async function siteResponse(domain) {
+  const { response, chain } = await requestChain(`https://${domain}/`, {
     source: domain,
     timeout: 8000,
     headers: { accept: 'text/html,*/*' },
@@ -331,13 +539,17 @@ async function securityHeaders(domain) {
   // pulling a multi-megabyte page into a Worker.
   let html = '';
   if ((h.get('content-type') ?? '').includes('html')) {
-    html = await readCapped(response, 250_000);
+    html = await readCapped(response, 300_000);
   }
 
+  const cookies = (h.getSetCookie?.() ?? [h.get('set-cookie')].filter(Boolean)).join('; ');
+
   return {
-    page: html ? describePage(html) : null,
+    page: html ? describePage(html, domain) : null,
+    technologies: fingerprint({ headers: h, html, cookies }),
+    chain: chain.length > 1 ? chain : null,
     status: response.status,
-    finalUrl: response.url,
+    finalUrl: chain[chain.length - 1]?.url ?? response.url,
     server: present('server'),
     poweredBy: present('x-powered-by'),
     strictTransportSecurity: present('strict-transport-security'),
@@ -349,33 +561,16 @@ async function securityHeaders(domain) {
     // A CDN in front changes what every other signal means, so name it.
     cdn: detectCdn(h),
     cookies: h.getSetCookie?.().length ?? (h.get('set-cookie') ? 1 : 0),
+    cookieNames: (h.getSetCookie?.() ?? [])
+      .map((c) => c.split('=')[0].trim())
+      .filter(Boolean)
+      .slice(0, 12),
   };
 }
 
-/** Read at most `limit` bytes of a response body, then stop. */
-async function readCapped(response, limit) {
-  const reader = response.body?.getReader();
-  if (!reader) return '';
-
-  const decoder = new TextDecoder();
-  let out = '';
-  try {
-    while (out.length < limit) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      out += decoder.decode(value, { stream: true });
-    }
-  } catch {
-    // A truncated read still gives us a usable <head>.
-  } finally {
-    reader.cancel().catch(() => {});
-  }
-  return out.slice(0, limit);
-}
-
 /** Pull identity and ownership signals out of the page source. */
-function describePage(html) {
-  const head = html.slice(0, 120_000);
+function describePage(html, domain) {
+  const head = html.slice(0, 150_000);
 
   const meta = (attr, name) => {
     const pattern = new RegExp(
@@ -391,29 +586,46 @@ function describePage(html) {
 
   const unique = (values) => [...new Set(values)];
 
-  // Analytics and tag IDs are among the strongest ownership pivots available:
-  // the same measurement ID across two sites is good evidence of a common
-  // operator. Searchable on publicwww / SpyOnWeb / Analyzeid.
+  // Service and analytics IDs are among the strongest ownership pivots
+  // available: the same measurement ID, Sentry project or Firebase project on
+  // two sites is good evidence of a common operator. Searchable on publicwww,
+  // SpyOnWeb and Analyzeid.
   const trackers = [
     ...[...html.matchAll(/\b(G-[A-Z0-9]{6,12})\b/g)].map((m) => ({ type: 'Google Analytics 4', id: m[1] })),
     ...[...html.matchAll(/\b(UA-\d{4,10}-\d{1,4})\b/g)].map((m) => ({ type: 'Google Analytics (legacy)', id: m[1] })),
     ...[...html.matchAll(/\b(GTM-[A-Z0-9]{4,10})\b/g)].map((m) => ({ type: 'Google Tag Manager', id: m[1] })),
+    ...[...html.matchAll(/\b(AW-\d{9,12})\b/g)].map((m) => ({ type: 'Google Ads', id: m[1] })),
+    ...[...html.matchAll(/\b(ca-pub-\d{10,20})\b/g)].map((m) => ({ type: 'Google AdSense', id: m[1] })),
     ...[...html.matchAll(/fbq\(\s*['"]init['"]\s*,\s*['"](\d{8,20})['"]/g)].map((m) => ({ type: 'Meta Pixel', id: m[1] })),
     ...[...html.matchAll(/hjid\s*:\s*(\d{5,10})/g)].map((m) => ({ type: 'Hotjar', id: m[1] })),
+    ...[...html.matchAll(/\bportalId["'\s:]+["']?(\d{5,10})/g)].map((m) => ({ type: 'HubSpot portal', id: m[1] })),
+    ...[...html.matchAll(/app_id["'\s:]+["']([a-z0-9]{6,10})["']/gi)].map((m) => ({ type: 'Intercom app', id: m[1] })),
+    ...[...html.matchAll(/https:\/\/[a-f0-9]{8,32}@(?:[a-z0-9.-]*\.)?(?:ingest\.)?sentry\.io\/(\d{4,12})/gi)].map((m) => ({ type: 'Sentry project', id: m[1] })),
+    ...[...html.matchAll(/projectId["'\s:]+["']([a-z0-9-]{4,40})["']/gi)].map((m) => ({ type: 'Firebase project', id: m[1] })),
+    ...[...html.matchAll(/\b(pk_live_[A-Za-z0-9]{10,50})\b/g)].map((m) => ({ type: 'Stripe publishable key', id: m[1] })),
+    ...[...html.matchAll(/cdn\.segment\.(?:com|io)\/analytics\.js\/v1\/([A-Za-z0-9]{10,40})\//g)].map((m) => ({ type: 'Segment write key', id: m[1] })),
+    ...[...html.matchAll(/\bUA_ID|_paq\.push\(\['setSiteId',\s*['"](\d{1,6})['"]/g)].map((m) => ({ type: 'Matomo site', id: m[1] })),
   ];
 
   const seen = new Set();
-  const trackingIds = trackers.filter((t) => !seen.has(t.id) && seen.add(t.id)).slice(0, 12);
+  const trackingIds = trackers.filter((t) => t.id && !seen.has(t.id) && seen.add(t.id)).slice(0, 20);
 
   return {
     title: head.match(/<title[^>]*>([\s\S]{1,300}?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() ?? null,
     description: meta('name', 'description'),
     siteName: meta('property', 'og:site_name') ?? meta('name', 'application-name'),
     ogTitle: meta('property', 'og:title'),
+    ogUrl: meta('property', 'og:url'),
     author: meta('name', 'author'),
+    publisher: meta('name', 'publisher'),
     // `generator` names the CMS or site builder outright.
     generator: meta('name', 'generator'),
     themeColor: meta('name', 'theme-color'),
+    twitterSite: meta('name', 'twitter:site'),
+    twitterCreator: meta('name', 'twitter:creator'),
+    // App-store links tie a website to a named developer account.
+    appleApp: meta('name', 'apple-itunes-app'),
+    androidApp: meta('name', 'google-play-app'),
     language: html.match(/<html[^>]+lang\s*=\s*["']([a-z-]{2,10})["']/i)?.[1] ?? null,
     // A copyright line often carries the legal entity name.
     copyright: unique(
@@ -429,13 +641,219 @@ function describePage(html) {
         .filter((e) => !/\.(png|jpe?g|gif|svg|webp|css|js)$/i.test(e))
         .filter((e) => !/@(example|yourdomain|domain|email|test|sample|placeholder)\.(com|org|net)$/.test(e))
         .filter((e) => !/^(you|user|name|email|someone|john\.?doe)@/.test(e)),
-    ).slice(0, 10),
-    socialProfiles: unique(
-      [...html.matchAll(/https?:\/\/(?:www\.)?(twitter\.com|x\.com|linkedin\.com|github\.com|facebook\.com|instagram\.com|youtube\.com|mastodon\.social)\/([A-Za-z0-9_.\-\/]{2,60})/g)]
-        .map((m) => `https://${m[1]}/${m[2]}`.replace(/[/.]+$/, '')),
     ).slice(0, 12),
+    // `tel:` links are published contact numbers, and feed straight into a
+    // phone lookup.
+    phones: unique(
+      [...html.matchAll(/href\s*=\s*["']tel:([+0-9().\-\s]{6,24})["']/gi)]
+        .map((m) => m[1].replace(/\s+/g, ' ').trim()),
+    ).slice(0, 8),
+    socialProfiles: socialProfilesIn(html, domain),
     trackingIds,
+    structuredData: parseJsonLd(html),
   };
+}
+
+/**
+ * Social profile links, reduced to actual accounts.
+ *
+ * The naive version of this — every URL on a social host — is close to useless
+ * on a large site, because product and marketing links vastly outnumber profile
+ * links, and on a social platform's own site every internal link matches. Three
+ * rules fix it: keep only the first path segment (a handle is never nested),
+ * drop the platform's own site when it is the domain under analysis, and reject
+ * the reserved product paths that are not accounts.
+ */
+const NON_PROFILE_SEGMENTS = new Set([
+  'about', 'home', 'help', 'search', 'explore', 'settings', 'login', 'signup',
+  'features', 'pricing', 'marketplace', 'enterprise', 'security', 'legal',
+  'privacy', 'terms', 'blog', 'news', 'watch', 'shorts', 'channel', 'playlist',
+  'sharer', 'share', 'intent', 'hashtag', 'pages', 'groups', 'events', 'p',
+  'i', 'reel', 'status', 'topics', 'trending', 'notifications', 'messages',
+  'developers', 'business', 'ads', 'careers', 'jobs', 'download', 'apps',
+  'why-github', 'mcp', 'sponsors', 'collections', 'trending', 'contact',
+]);
+
+function socialProfilesIn(html, domain) {
+  const pattern = /https?:\/\/(?:www\.)?(twitter\.com|x\.com|linkedin\.com|github\.com|gitlab\.com|facebook\.com|instagram\.com|youtube\.com|tiktok\.com|reddit\.com|mastodon\.social|bsky\.app|t\.me|discord\.gg|medium\.com|threads\.net|vimeo\.com|twitch\.tv|patreon\.com|substack\.com)\/([A-Za-z0-9_.\-@]{2,40})/g;
+  const apex = registrableDomain(domain.split('.'));
+  const found = new Set();
+
+  for (const match of html.matchAll(pattern)) {
+    const host = match[1].toLowerCase();
+    // On a platform's own site every internal link looks like a profile.
+    if (registrableDomain(host.split('.')) === apex) continue;
+
+    const handle = match[2].replace(/[/.]+$/, '');
+    const bare = handle.replace(/^@/, '').toLowerCase();
+    if (!bare || NON_PROFILE_SEGMENTS.has(bare)) continue;
+    // File names, not handles.
+    if (/\.(png|jpe?g|gif|svg|webp|ico|css|js|json|xml)$/i.test(bare)) continue;
+    // LinkedIn nests real profiles one level down; keep those two forms only.
+    if (host === 'linkedin.com' && !['company', 'in', 'school', 'showcase'].includes(bare)) continue;
+
+    const rest = host === 'linkedin.com'
+      ? html.slice(match.index).match(/^https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in|school|showcase)\/([A-Za-z0-9_.-]{2,60})/)?.[1]
+      : null;
+
+    found.add(host === 'linkedin.com'
+      ? (rest ? `https://linkedin.com/${bare}/${rest}` : null)
+      : `https://${host}/${handle}`);
+  }
+
+  found.delete(null);
+  return [...found].slice(0, 16);
+}
+
+/**
+ * schema.org JSON-LD.
+ *
+ * When a site publishes an Organization or LocalBusiness block, it hands over
+ * the legal name, street address, phone number, founding date and its own list
+ * of official profiles — self-declared, structured, and far more reliable than
+ * anything scraped out of prose. It is routinely present and almost never read.
+ */
+function parseJsonLd(html) {
+  const blocks = [...html.matchAll(/<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]{0,20000}?)<\/script>/gi)];
+  const entities = [];
+
+  for (const block of blocks.slice(0, 6)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(block[1].trim());
+    } catch {
+      continue; // Malformed JSON-LD is extremely common; skip it quietly.
+    }
+
+    // A block may be one object, an array, or a @graph wrapper.
+    const candidates = []
+      .concat(parsed)
+      .flatMap((item) => (item && item['@graph'] ? item['@graph'] : item))
+      .filter((item) => item && typeof item === 'object');
+
+    for (const item of candidates) {
+      const type = [].concat(item['@type'] ?? []).join(', ');
+      if (!/Organization|Corporation|LocalBusiness|Person|NewsMediaOrganization|Store|Restaurant/i.test(type)) continue;
+
+      const address = item.address ?? {};
+      entities.push({
+        type,
+        name: item.name ?? item.legalName ?? null,
+        legalName: item.legalName ?? null,
+        url: item.url ?? null,
+        email: item.email ?? null,
+        telephone: item.telephone ?? [].concat(item.contactPoint ?? [])[0]?.telephone ?? null,
+        address: [address.streetAddress, address.addressLocality, address.addressRegion,
+          address.postalCode, address.addressCountry].filter((v) => typeof v === 'string').join(', ') || null,
+        founder: [].concat(item.founder ?? []).map((f) => (typeof f === 'string' ? f : f?.name)).filter(Boolean),
+        foundingDate: item.foundingDate ?? null,
+        taxId: item.taxID ?? item.vatID ?? null,
+        // `sameAs` is the operator's own list of its official profiles.
+        sameAs: [].concat(item.sameAs ?? []).filter((v) => typeof v === 'string').slice(0, 12),
+      });
+    }
+  }
+
+  return entities.length ? entities.slice(0, 4) : null;
+}
+
+/**
+ * Favicon hash.
+ *
+ * Shodan, Censys and FOFA all index the MurmurHash3 of a site's base64-encoded
+ * favicon. Because operators almost never change the icon when they move or
+ * rename infrastructure, searching that hash finds every other host serving the
+ * same site — including the origin server sitting behind a CDN, which is
+ * otherwise one of the hardest things to establish from outside.
+ */
+async function faviconFingerprint(domain) {
+  const bytes = await getBytes(`https://${domain}/favicon.ico`, {
+    source: `${domain}/favicon.ico`,
+    timeout: 7000,
+  });
+
+  // An SPA that serves its shell for every path returns HTML here.
+  if (!bytes.length || bytes.length > 400_000) throw new Error('No usable favicon at the conventional path');
+  const head = new TextDecoder().decode(bytes.slice(0, 40)).toLowerCase();
+  if (head.includes('<html') || head.includes('<!doctype')) {
+    throw new Error('The favicon path returned HTML, not an icon');
+  }
+
+  const hash = faviconHash(bytes);
+  return {
+    hash,
+    bytes: bytes.length,
+    shodanQuery: `http.favicon.hash:${hash}`,
+    shodanUrl: `https://www.shodan.io/search?query=${encodeURIComponent(`http.favicon.hash:${hash}`)}`,
+    censysUrl: `https://search.censys.io/search?resource=hosts&q=${encodeURIComponent(`services.http.response.favicons.md5_hash:*`)}`,
+    fofaQuery: `icon_hash="${hash}"`,
+    note: 'Searching this hash finds every other host serving the same icon — the standard way to locate an origin server behind a CDN.',
+  };
+}
+
+/**
+ * Files the site publishes at conventional public paths.
+ *
+ * Nothing here is a probe for something hidden: every path is a documented
+ * convention that the operator publishes deliberately. `robots.txt` names the
+ * paths they would rather crawlers avoided — which is where the interesting
+ * parts of a site usually are — and `ads.txt` lists the ad-network publisher
+ * accounts a site sells through, so the same account ID on another site is a
+ * direct, hard link between the two.
+ */
+async function wellKnownFiles(domain, deep) {
+  const wanted = deep ? WELL_KNOWN_FILES : WELL_KNOWN_FILES.slice(0, 2);
+
+  const settled = await Promise.allSettled(
+    wanted.map((file) =>
+      getText(`https://${domain}${file.path}`, { source: `${domain}${file.path}`, timeout: 6000 })),
+  );
+
+  const files = [];
+  settled.forEach((outcome, i) => {
+    if (outcome.status !== 'fulfilled') return;
+    const text = outcome.value;
+    // SPA shells answer every path with HTML; that is not a published file.
+    if (/<html|<!doctype/i.test(text.slice(0, 200)) || text.length > 200_000) return;
+
+    files.push({ ...wanted[i], bytes: text.length, ...summarizeFile(wanted[i].path, text) });
+  });
+
+  return { checked: wanted.length, files };
+}
+
+function summarizeFile(path, text) {
+  if (path === '/robots.txt') {
+    const disallowed = [...text.matchAll(/^\s*Disallow:\s*(\S+)/gim)].map((m) => m[1]);
+    return {
+      sitemaps: [...text.matchAll(/^\s*Sitemap:\s*(\S+)/gim)].map((m) => m[1]).slice(0, 8),
+      // The paths an operator asks crawlers to skip are, reliably, the paths
+      // they consider sensitive.
+      disallowed: [...new Set(disallowed)].filter((p) => p !== '/').slice(0, 40),
+      disallowedCount: new Set(disallowed).size,
+      agents: [...new Set([...text.matchAll(/^\s*User-agent:\s*(\S+)/gim)].map((m) => m[1]))].slice(0, 12),
+    };
+  }
+
+  if (path === '/ads.txt' || path === '/app-ads.txt') {
+    const rows = text.split('\n')
+      .map((line) => line.split('#')[0].trim())
+      .filter((line) => line && line.includes(','))
+      .map((line) => {
+        const [exchange, publisherId, relationship] = line.split(',').map((f) => f.trim());
+        return { exchange, publisherId, relationship: relationship ?? null };
+      });
+    return {
+      sellers: rows.slice(0, 40),
+      sellerCount: rows.length,
+      // A DIRECT entry means the publisher account belongs to this site's
+      // owner, which is what makes it usable as an ownership link.
+      directAccounts: [...new Set(rows.filter((r) => /direct/i.test(r.relationship ?? ''))
+        .map((r) => `${r.exchange}:${r.publisherId}`))].slice(0, 20),
+    };
+  }
+
+  return { excerpt: text.slice(0, 600).trim() || null };
 }
 
 /**
@@ -515,6 +933,8 @@ function detectCdn(headers) {
   if (headers.get('x-vercel-id')) return 'Vercel';
   if (headers.get('x-nf-request-id')) return 'Netlify';
   if (headers.get('x-github-request-id')) return 'GitHub Pages';
+  if (headers.get('x-sucuri-id')) return 'Sucuri';
+  if (headers.get('x-iinfo')) return 'Imperva';
   return null;
 }
 
@@ -537,6 +957,7 @@ async function urlScan(domain) {
     title: r.page?.title ?? null,
     scannedAt: r.task?.time ? r.task.time.slice(0, 10) : null,
     address: r.page?.ip ?? null,
+    asn: r.page?.asn ?? null,
     server: r.page?.server ?? null,
     country: r.page?.country ?? null,
     tlsIssuer: r.page?.tlsIssuer ?? null,
@@ -550,6 +971,7 @@ async function urlScan(domain) {
     // Addresses urlscan actually observed serving the site, which can differ
     // from what it resolves to right now.
     observedAddresses: [...new Set(results.map((r) => r.address).filter(Boolean))],
+    observedAsns: [...new Set(results.map((r) => r.asn).filter(Boolean))],
   };
 }
 
@@ -564,9 +986,7 @@ async function urlScan(domain) {
  * The cap is deliberate. Resolving all ~300 candidates would cost more
  * subrequests than the whole rest of the report put together.
  */
-const LOOKALIKE_RESOLVE_LIMIT = 6;
-
-async function lookalikes(domain) {
+async function lookalikes(domain, limit) {
   const hex = [...domain].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
   const body = await getJson(`https://dnstwister.report/api/fuzz/${hex}`, {
     source: 'dnstwister.report',
@@ -588,7 +1008,7 @@ async function lookalikes(domain) {
     return rank(a.technique) - rank(b.technique);
   });
 
-  const checked = ranked.slice(0, LOOKALIKE_RESOLVE_LIMIT);
+  const checked = ranked.slice(0, limit);
   const settled = await Promise.allSettled(checked.map((c) => resolve(c.domain, 'A')));
 
   const registered = [];
@@ -616,12 +1036,102 @@ async function virusTotalDomain(domain, key) {
     source: 'virustotal.com',
     headers: { 'x-apikey': key },
   });
-  const stats = body.data?.attributes?.last_analysis_stats ?? {};
+  const attributes = body.data?.attributes ?? {};
+  const stats = attributes.last_analysis_stats ?? {};
   return {
     malicious: stats.malicious ?? 0,
     suspicious: stats.suspicious ?? 0,
     harmless: stats.harmless ?? 0,
-    reputation: body.data?.attributes?.reputation ?? null,
+    reputation: attributes.reputation ?? null,
+    categories: Object.values(attributes.categories ?? {}).slice(0, 6),
+    flaggedBy: Object.entries(attributes.last_analysis_results ?? {})
+      .filter(([, result]) => result.category === 'malicious')
+      .map(([vendor]) => vendor)
+      .slice(0, 12),
+  };
+}
+
+/**
+ * Resolve discovered subdomains and read what the answers imply.
+ *
+ * Three findings come out of one batch of lookups:
+ *
+ *   - which CT names are live at all, since most are historical
+ *   - which resolve *outside* the address set the apex uses, which on a
+ *     CDN-fronted site is the classic origin-server exposure
+ *   - which point at a SaaS platform via CNAME but no longer resolve to a live
+ *     site there, the precondition for a subdomain takeover
+ */
+async function mapSubdomains(subdomains, domain, apexAddresses) {
+  const candidates = subdomains.filter((name) => name !== domain);
+  if (!candidates.length) return { checked: 0, live: [], groups: [], originCandidates: [], takeoverCandidates: [] };
+
+  // Rank interesting prefixes first, then shortest — a two-label name is more
+  // likely to be real infrastructure than a long generated one.
+  const score = (name) => {
+    const label = name.slice(0, name.length - domain.length - 1);
+    const head = label.split('.').pop();
+    const index = INTERESTING_PREFIXES.findIndex((p) => head === p || head.startsWith(p));
+    return index === -1 ? 500 + label.length : index;
+  };
+  const chosen = candidates.slice().sort((a, b) => score(a) - score(b)).slice(0, 25);
+
+  const results = await resolveBatch(chosen, 'A');
+  const apexSet = new Set(apexAddresses);
+
+  const live = [];
+  const takeoverCandidates = [];
+
+  for (const result of results) {
+    const alias = result.aliases[result.aliases.length - 1] ?? null;
+
+    if (result.records.length) {
+      live.push({ name: result.name, addresses: result.records, cname: alias });
+      continue;
+    }
+
+    // No address, but a CNAME into a known platform: the takeover shape.
+    if (alias) {
+      const signature = TAKEOVER_SIGNATURES.find((s) => s.cname.test(alias));
+      if (signature) {
+        takeoverCandidates.push({
+          name: result.name,
+          cname: alias,
+          service: signature.service,
+          status: result.status,
+          note: 'The alias target does not resolve. If the platform account has been released, this name may be claimable by a third party. Confirm before acting on it.',
+        });
+      }
+    }
+  }
+
+  // Group by address so shared infrastructure is obvious at a glance.
+  const byAddress = new Map();
+  for (const entry of live) {
+    for (const address of entry.addresses) {
+      if (!byAddress.has(address)) byAddress.set(address, []);
+      byAddress.get(address).push(entry.name);
+    }
+  }
+
+  const groups = [...byAddress.entries()]
+    .map(([address, names]) => ({ address, names, count: names.length }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 15);
+
+  // Addresses used by a subdomain but not by the apex. When the apex is behind
+  // a CDN, these are the un-fronted hosts.
+  const originCandidates = groups
+    .filter((group) => !apexSet.has(group.address))
+    .slice(0, 10);
+
+  return {
+    discovered: candidates.length,
+    checked: chosen.length,
+    live,
+    groups,
+    originCandidates,
+    takeoverCandidates,
   };
 }
 
@@ -644,6 +1154,7 @@ async function enrichAddresses(addresses) {
         asn: g?.connection?.asn ? `AS${g.connection.asn}` : null,
         ports: e?.ports ?? [],
         vulnerabilities: e?.vulns ?? [],
+        hostnames: e?.hostnames ?? [],
       };
     }),
   );
@@ -659,6 +1170,49 @@ function formatDns(dns) {
   return out;
 }
 
+/**
+ * Who actually runs each piece of this domain's infrastructure.
+ *
+ * The individual records are already in the report; what an investigator wants
+ * from them is one line per function — mail here, DNS there, edge somewhere
+ * else — because that is the shape that tells you which organisations to go and
+ * ask, and which of them would hold logs.
+ */
+function identifyProviders(data) {
+  const mx = (data.dns?.MX?.records ?? []).map((r) => r.split(/\s+/).pop());
+  const ns = data.dns?.NS?.records ?? data.registration?.nameservers ?? [];
+
+  return {
+    mail: mailProvider(...mx),
+    mailServers: mx.slice(0, 8),
+    dns: dnsProvider(...ns),
+    nameservers: ns.slice(0, 8),
+    cdn: data.headers?.cdn ?? null,
+    registrar: data.registration?.registrar ?? null,
+    // A DMARC reporting address at a vendor's domain names the vendor.
+    dmarcReporting: data.email?.dmarc?.reportingDomains ?? [],
+    // DKIM selectors are the most complete list of sending platforms available.
+    sendingPlatforms: (data.dkim?.platforms ?? []).filter((p) => p !== 'generic'),
+  };
+}
+
+/** Consolidate the DNSSEC signals, which are spread across three records. */
+function dnssecPosture(data) {
+  const ds = data.dns?.DS?.records ?? [];
+  const dnskey = data.dnskey?.records ?? [];
+  const delegated = data.registration?.dnssec;
+
+  return {
+    delegationSigned: delegated ?? (ds.length > 0 ? true : null),
+    dsRecords: ds.length,
+    dnskeyRecords: dnskey.length || null,
+    // A zone with keys but no DS at the parent is signed but not trusted —
+    // a misconfiguration that looks like DNSSEC without providing it.
+    signedButNotDelegated: dnskey.length > 0 && ds.length === 0,
+    algorithms: [...new Set(ds.map((r) => r.split(/\s+/)[1]).filter(Boolean))],
+  };
+}
+
 /* ------------------------------------------------------------------ identity */
 
 /**
@@ -666,10 +1220,10 @@ function formatDns(dns) {
  *
  * RDAP registrant data is redacted for most gTLDs post-GDPR, so the answer to
  * "who runs this domain" usually has to be assembled from what the operator
- * publishes voluntarily: the site's own metadata, its copyright line, its
- * security.txt contact. Each candidate carries the source it came from and how
- * far it can be trusted, because these differ enormously — a registry
- * registrant field is authoritative, a copyright string is a guess.
+ * publishes voluntarily: structured data, the site's own metadata, its
+ * copyright line, its security.txt contact. Each candidate carries the source
+ * it came from and how far it can be trusted, because these differ enormously —
+ * a registry registrant field is authoritative, a copyright string is a guess.
  */
 function identity(data) {
   const page = data.headers?.page ?? null;
@@ -680,8 +1234,12 @@ function identity(data) {
     if (!value) return;
     const clean = String(value).trim();
     if (clean.length < 2 || clean.length > 120) return;
-    if (names.some((n) => n.value.toLowerCase() === clean.toLowerCase())) return;
-    names.push({ value: clean, source, confidence });
+    const existing = names.find((n) => n.value.toLowerCase() === clean.toLowerCase());
+    if (existing) {
+      existing.corroboration = (existing.corroboration ?? 1) + 1;
+      return;
+    }
+    names.push({ value: clean, source, confidence, corroboration: 1 });
   };
 
   // Authoritative when present — but usually redacted.
@@ -692,10 +1250,18 @@ function identity(data) {
     add(reg.administrative.organization ?? reg.administrative.name, 'RDAP admin contact', 'high');
   }
 
-  // Self-declared, and generally accurate — the operator wrote it.
+  // Self-declared and structured: the operator wrote it, in a machine-readable
+  // field whose whole purpose is to state the legal entity.
+  for (const entity of page?.structuredData ?? []) {
+    add(entity.legalName, 'schema.org legalName', 'high');
+    add(entity.name, 'schema.org name', 'medium');
+  }
+
+  // Self-declared prose. Generally accurate, but not a legal name.
   add(page?.siteName, 'og:site_name', 'medium');
   page?.copyright?.forEach((c) => add(c, 'copyright notice', 'medium'));
   add(page?.author, 'author meta tag', 'medium');
+  add(page?.publisher, 'publisher meta tag', 'medium');
 
   // Weakest: a title is marketing copy, not a legal entity.
   add(page?.title?.split(/\s[|·—–-]\s/)[0], 'page title', 'low');
@@ -707,14 +1273,31 @@ function identity(data) {
   if (reg?.abuseContact?.email) {
     contacts.push({ value: reg.abuseContact.email, source: 'RDAP registrar abuse', role: 'abuse' });
   }
+  for (const entity of page?.structuredData ?? []) {
+    if (entity.email) contacts.push({ value: entity.email, source: 'schema.org', role: 'published' });
+    if (entity.telephone) contacts.push({ value: entity.telephone, source: 'schema.org', role: 'phone' });
+    if (entity.address) contacts.push({ value: entity.address, source: 'schema.org', role: 'address' });
+  }
   for (const email of page?.emails ?? []) {
     contacts.push({ value: email, source: 'page source', role: 'published' });
   }
+  for (const phone of page?.phones ?? []) {
+    contacts.push({ value: phone, source: 'tel: link', role: 'phone' });
+  }
+
+  const rank = { high: 0, medium: 1, low: 2 };
+  names.sort((a, b) => rank[a.confidence] - rank[b.confidence] || b.corroboration - a.corroboration);
+
+  // `sameAs` is the operator's own declaration of which profiles are theirs,
+  // which is worth more than a link found somewhere in the page body.
+  const declaredProfiles = (page?.structuredData ?? []).flatMap((e) => e.sameAs ?? []);
 
   return {
     names,
-    contacts: contacts.slice(0, 12),
-    socialProfiles: page?.socialProfiles ?? [],
+    best: names[0] ?? null,
+    contacts: dedupe(contacts, (c) => `${c.role}:${c.value.toLowerCase()}`).slice(0, 16),
+    socialProfiles: [...new Set([...declaredProfiles, ...(page?.socialProfiles ?? [])])].slice(0, 16),
+    declaredProfiles,
     trackingIds: page?.trackingIds ?? [],
     // Say plainly why the registrant is missing, rather than showing a blank.
     registrantStatus: reg?.registrant?.redacted
@@ -725,9 +1308,19 @@ function identity(data) {
   };
 }
 
+function dedupe(items, key) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const k = key(item);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 /* --------------------------------------------------------------- assessment */
 
-function assess(domain, data, hosts) {
+function assess(domain, data, hosts, subdomainDetail) {
   const findings = [];
   const reg = data.registration;
 
@@ -745,8 +1338,23 @@ function assess(domain, data, hosts) {
       detail: 'An expiring domain can be lost, re-registered by a third party, or dropped from DNS.',
     });
   }
-  if (reg && reg.dnssec === false) {
+
+  if (data.dnssec?.signedButNotDelegated) {
+    findings.push({
+      level: 'warn',
+      title: 'Zone is signed but the delegation is not',
+      detail: 'DNSKEY records exist but no DS record is published at the parent, so resolvers cannot validate the signatures. This provides the cost of DNSSEC with none of the protection.',
+    });
+  } else if (reg && reg.dnssec === false) {
     findings.push({ level: 'info', title: 'DNSSEC not enabled', detail: 'Responses for this zone are not cryptographically signed.' });
+  }
+
+  if (data.wildcard?.wildcard) {
+    findings.push({
+      level: 'info',
+      title: 'Wildcard DNS is enabled',
+      detail: `A random name (${data.wildcard.probe}) resolved to ${data.wildcard.addresses.join(', ')}. Every subdomain "exists" on this zone, so resolution proves nothing about whether a name was deliberately configured.`,
+    });
   }
 
   const email = data.email;
@@ -771,11 +1379,60 @@ function assess(domain, data, hosts) {
     }
   }
 
+  if (data.dkim?.found?.length) {
+    const platforms = [...new Set(data.dkim.found.map((f) => f.platform).filter((p) => p !== 'generic'))];
+    findings.push({
+      level: 'info',
+      title: `${data.dkim.found.length} DKIM selector(s) published`,
+      detail: (platforms.length
+        ? `Sending platforms in use: ${platforms.join(', ')}. `
+        : '')
+        + 'Each selector is a service authorised to send mail as this domain, and several appear nowhere else in DNS.',
+    });
+    const weak = data.dkim.found.filter((f) => f.keyBits && f.keyBits < 1024);
+    if (weak.length) {
+      findings.push({
+        level: 'warn',
+        title: `${weak.length} DKIM key(s) shorter than 1024 bits`,
+        detail: `Selectors: ${weak.map((w) => w.selector).join(', ')}. Keys this short are considered forgeable and some receivers ignore them entirely.`,
+      });
+    }
+  }
+
+  if (data.srv?.found?.length) {
+    findings.push({
+      level: 'info',
+      title: `${data.srv.found.length} SRV service record(s)`,
+      detail: data.srv.found.slice(0, 6).map((s) => `${s.service} → ${s.target}:${s.port}`).join(' · ')
+        + '. SRV targets name internal hosts that A records for the apex never expose.',
+    });
+  }
+
   if (!(data.dns?.CAA?.records ?? []).length) {
     findings.push({ level: 'info', title: 'No CAA record', detail: 'Any certificate authority may issue certificates for this domain.' });
   }
 
-  const headers = data.httpHeaders;
+  const takeovers = subdomainDetail?.takeoverCandidates ?? [];
+  if (takeovers.length) {
+    findings.push({
+      level: 'danger',
+      title: `${takeovers.length} possible subdomain takeover${takeovers.length === 1 ? '' : 's'}`,
+      detail: takeovers.map((t) => `${t.name} → ${t.cname} (${t.service})`).join(' · ')
+        + '. Each of these points at a platform where the target no longer resolves. Verify the account is genuinely unclaimed before treating this as confirmed.',
+    });
+  }
+
+  const origins = subdomainDetail?.originCandidates ?? [];
+  if (origins.length && data.headers?.cdn) {
+    findings.push({
+      level: 'warn',
+      title: `${origins.length} subdomain address${origins.length === 1 ? '' : 'es'} outside the CDN`,
+      detail: origins.slice(0, 5).map((o) => `${o.address} (${o.names.slice(0, 3).join(', ')})`).join(' · ')
+        + `. The apex is fronted by ${data.headers.cdn}, but these names resolve directly. Addresses like these are how a CDN's protection gets bypassed.`,
+    });
+  }
+
+  const headers = data.headers;
   if (headers) {
     const missing = [];
     if (!headers.strictTransportSecurity) missing.push('HSTS');
@@ -787,6 +1444,62 @@ function assess(domain, data, hosts) {
     if (headers.poweredBy) {
       findings.push({ level: 'info', title: 'Server software disclosed', detail: `\`X-Powered-By: ${headers.poweredBy}\` leaks the backend stack.` });
     }
+    if (headers.chain?.length > 1) {
+      const hops = headers.chain.map((h) => h.url);
+      const offsite = hops.filter((url) => {
+        try { return !new URL(url).hostname.endsWith(domain.split('.').slice(-2).join('.')); } catch { return false; }
+      });
+      if (offsite.length) {
+        findings.push({
+          level: 'warn',
+          title: 'Redirects off-site before serving content',
+          detail: `Route: ${hops.join(' → ')}. A redirect to a different registrable domain is worth explaining — it is the shape of an affiliate hop, a parked domain, or a hijack.`,
+        });
+      }
+    }
+  }
+
+  if (data.technologies?.length) {
+    const categories = [...new Set(data.technologies.map((t) => t.category))];
+    findings.push({
+      level: 'info',
+      title: `${data.technologies.length} technologies fingerprinted`,
+      detail: `${categories.join(', ')}. Detected from response headers, cookie names and page source — no probing.`,
+    });
+  }
+
+  if (data.favicon?.hash) {
+    findings.push({
+      level: 'info',
+      title: `Favicon hash ${data.favicon.hash}`,
+      detail: 'Searching this hash on Shodan or FOFA returns every other host serving the same icon. It is the standard way to find an origin server behind a CDN, and to link sites that share a template.',
+    });
+  }
+
+  const publicFiles = data.publicFiles?.files ?? [];
+  const robots = publicFiles.find((f) => f.path === '/robots.txt');
+  if (robots?.disallowedCount) {
+    findings.push({
+      level: 'info',
+      title: `robots.txt lists ${robots.disallowedCount} disallowed path(s)`,
+      detail: `${robots.disallowed.slice(0, 8).join(', ')}${robots.disallowedCount > 8 ? ', …' : ''}. Paths an operator asks crawlers to avoid are, reliably, the ones they consider sensitive.`,
+    });
+  }
+  const ads = publicFiles.find((f) => f.path === '/ads.txt' && f.directAccounts?.length);
+  if (ads) {
+    findings.push({
+      level: 'info',
+      title: `ads.txt declares ${ads.directAccounts.length} direct seller account(s)`,
+      detail: `${ads.directAccounts.slice(0, 5).join(', ')}. A DIRECT account belongs to this site's owner, so the same ID on another site is a hard ownership link between them.`,
+    });
+  }
+
+  if (data.certificates?.relatedDomains?.length) {
+    findings.push({
+      level: 'info',
+      title: `${data.certificates.relatedDomains.length} other domain(s) share a certificate with this one`,
+      detail: `${data.certificates.relatedDomains.slice(0, 8).join(', ')}${data.certificates.relatedDomains.length > 8 ? ', …' : ''}. A certificate covering two domains was issued to whoever proved control of both.`,
+    });
   }
 
   // A site archived long before its current registration date is a re-registered
@@ -818,8 +1531,20 @@ function assess(domain, data, hosts) {
   if (identified?.trackingIds?.length) {
     findings.push({
       level: 'info',
-      title: `${identified.trackingIds.length} analytics ID${identified.trackingIds.length === 1 ? '' : 's'} in the page source`,
-      detail: 'The same measurement ID appearing on another site is good evidence of a shared operator. Searchable on publicwww.com and analyzeid.com.',
+      title: `${identified.trackingIds.length} service ID${identified.trackingIds.length === 1 ? '' : 's'} in the page source`,
+      detail: identified.trackingIds.slice(0, 5).map((t) => `${t.id} (${t.type})`).join(', ')
+        + '. The same ID appearing on another site is good evidence of a shared operator. Searchable on publicwww.com and analyzeid.com.',
+    });
+  }
+
+  if (identified?.structuredData?.length) {
+    const entity = identified.structuredData[0];
+    findings.push({
+      level: 'ok',
+      title: `Site publishes structured data for ${entity.legalName ?? entity.name ?? 'an organisation'}`,
+      detail: [entity.type, entity.address, entity.telephone, entity.foundingDate ? `founded ${entity.foundingDate}` : null]
+        .filter(Boolean).join(' · ')
+        + '. Self-declared schema.org data is the operator naming themselves in a machine-readable field.',
     });
   }
 
@@ -833,7 +1558,13 @@ function assess(domain, data, hosts) {
 
   const subCount = data.certificates?.subdomains?.length ?? 0;
   if (subCount) {
-    findings.push({ level: 'info', title: `${subCount} subdomain${subCount === 1 ? '' : 's'} in Certificate Transparency`, detail: 'Names observed in publicly-logged certificates. Some may no longer resolve.' });
+    findings.push({
+      level: 'info',
+      title: `${subCount} subdomain${subCount === 1 ? '' : 's'} in Certificate Transparency`,
+      detail: subdomainDetail
+        ? `${subdomainDetail.live.length} of the ${subdomainDetail.checked} most interesting names still resolve.`
+        : 'Names observed in publicly-logged certificates. Some may no longer resolve — run a deep scan to check which.',
+    });
   }
 
   const vulnHosts = hosts.filter((h) => h.vulnerabilities.length);
@@ -859,8 +1590,8 @@ function daysBetween(from, to) {
   return Math.floor((new Date(to) - new Date(from)) / 86_400_000);
 }
 
-function pivots(domain) {
-  return [
+function pivots(domain, favicon) {
+  const links = [
     { label: 'crt.sh', url: `https://crt.sh/?q=${encodeURIComponent(`%.${domain}`)}` },
     { label: 'VirusTotal', url: `https://www.virustotal.com/gui/domain/${domain}` },
     { label: 'urlscan.io', url: `https://urlscan.io/domain/${domain}` },
@@ -868,5 +1599,15 @@ function pivots(domain) {
     { label: 'Shodan', url: `https://www.shodan.io/search?query=hostname%3A${encodeURIComponent(domain)}` },
     { label: 'SecurityTrails', url: `https://securitytrails.com/domain/${domain}/dns` },
     { label: 'BuiltWith', url: `https://builtwith.com/${domain}` },
+    { label: 'ViewDNS history', url: `https://viewdns.info/iphistory/?domain=${domain}` },
+    { label: 'DNSlytics', url: `https://dnslytics.com/domain/${domain}` },
+    { label: 'Netcraft', url: `https://sitereport.netcraft.com/?url=https://${domain}` },
+    { label: 'PublicWWW', url: `https://publicwww.com/websites/%22${encodeURIComponent(domain)}%22/` },
+    { label: 'Google site:', url: `https://www.google.com/search?q=${encodeURIComponent(`site:${domain}`)}` },
+    { label: 'Google related docs', url: `https://www.google.com/search?q=${encodeURIComponent(`site:${domain} (filetype:pdf OR filetype:xlsx OR filetype:docx)`)}` },
   ];
+  if (favicon?.hash != null) {
+    links.push({ label: `Shodan favicon ${favicon.hash}`, url: favicon.shodanUrl });
+  }
+  return links;
 }

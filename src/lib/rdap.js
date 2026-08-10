@@ -21,6 +21,7 @@ const IANA_BOOTSTRAP = {
   ip: 'https://data.iana.org/rdap/ipv4.json',
   ip6: 'https://data.iana.org/rdap/ipv6.json',
   domain: 'https://data.iana.org/rdap/dns.json',
+  autnum: 'https://data.iana.org/rdap/asn.json',
 };
 
 const REDIRECTOR = 'https://rdap.org';
@@ -109,7 +110,28 @@ async function baseUrlForDomain(domain) {
 }
 
 /**
- * Fetch an RDAP object. `kind` is "domain" or "ip".
+ * Resolve the authoritative RDAP base URL for an AS number.
+ *
+ * The ASN bootstrap maps ranges written as "36864-37887", so the match is a
+ * numeric interval test rather than the prefix maths the IP registries need.
+ */
+async function baseUrlForAsn(asn) {
+  const number = Number(String(asn).replace(/^AS/i, ''));
+  const registry = await bootstrap('autnum');
+
+  for (const [ranges, urls] of registry.services ?? []) {
+    for (const range of ranges) {
+      const [startText, endText = startText] = range.split('-');
+      if (number >= Number(startText) && number <= Number(endText)) {
+        return urls.find((u) => u.startsWith('https:')) ?? urls[0];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Fetch an RDAP object. `kind` is "domain", "ip" or "autnum".
  *
  * Tries the authoritative server named by IANA first, then falls back to the
  * rdap.org redirector so a bootstrap outage does not take the panel down.
@@ -122,7 +144,9 @@ export async function lookup(kind, target) {
 
   let base = null;
   try {
-    base = kind === 'ip' ? await baseUrlForIp(target) : await baseUrlForDomain(target);
+    base = kind === 'ip' ? await baseUrlForIp(target)
+      : kind === 'autnum' ? await baseUrlForAsn(target)
+        : await baseUrlForDomain(target);
   } catch {
     // Bootstrap unavailable — fall through to the redirector.
   }
@@ -199,6 +223,41 @@ export function entitiesByRole(entities = [], depth = 0) {
     }
   }
   return found;
+}
+
+/**
+ * Flatten RDAP `remarks` into plain lines.
+ *
+ * Remarks are free text and mostly boilerplate, but they are also where
+ * operators put the things that fit nowhere else: a routing policy, a note that
+ * a range is used for a specific product, or an explicit statement about which
+ * country the addresses are deployed in.
+ */
+export function remarkText(remarks = []) {
+  return remarks
+    .flatMap((remark) => remark.description ?? [])
+    .map((line) => String(line).trim())
+    .filter((line) => line.length > 2 && line.length < 400);
+}
+
+/**
+ * Find a geofeed URL in an RDAP record.
+ *
+ * RFC 9092 says operators may advertise a geofeed either in a typed `links`
+ * entry or as a bare `geofeed:` line inside a remark, and both are common in
+ * the wild. Missing the remark form loses most of the geofeeds that exist.
+ */
+export function geofeedUrl(body) {
+  const link = (body.links ?? []).find(
+    (l) => l.rel === 'geofeed' || /geofeed/i.test(l.title ?? '') || /geofeed/i.test(l.href ?? ''),
+  );
+  if (link?.href) return link.href;
+
+  for (const line of remarkText(body.remarks)) {
+    const match = line.match(/geofeed[:\s]+\s*(https?:\/\/\S+)/i);
+    if (match) return match[1].replace(/[.,;)]+$/, '');
+  }
+  return null;
 }
 
 /** Pull the named event date out of an RDAP `events` array. */
