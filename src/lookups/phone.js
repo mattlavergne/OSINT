@@ -12,7 +12,7 @@
 import { parsePhoneNumberWithError, ParseError, getExampleNumber } from 'libphonenumber-js/max';
 import examples from 'libphonenumber-js/mobile/examples';
 import { parsePhoneInput, ValidationError } from '../lib/validate.js';
-import { getJson } from '../lib/http.js';
+import { getJson, getText } from '../lib/http.js';
 
 /** Human labels for libphonenumber's number types. */
 const TYPE_LABELS = {
@@ -38,7 +38,25 @@ const TYPE_NOTES = {
   FIXED_LINE_OR_MOBILE: 'This range serves both fixed and mobile lines, so the type cannot be narrowed further.',
 };
 
-export async function lookupPhone(input, region, loadData, env = {}) {
+/**
+ * Operating company numbers whose names mean "this is a VoIP or wholesale
+ * number", not "this is a phone line in a building".
+ *
+ * These carriers sell numbers by the thousand through APIs with no address
+ * verification, which is why they sit behind most spoofed and disposable
+ * numbers. The LERG names the block holder outright, so this is a direct read
+ * rather than an inference from the number's shape.
+ */
+const WHOLESALE_CARRIERS = [
+  'bandwidth', 'twilio', 'telnyx', 'onvoy', 'peerless', 'inteliquent',
+  'level 3', 'lumen', 'sinch', 'vonage', 'nexmo', 'plivo', 'voxbone',
+  'flowroute', 'thinq', 'commio', 'teli', 'skype', 'microsoft', 'google voice',
+  'neutral tandem', 'transbeam', 'ringcentral', 'zoom', 'dialpad', '8x8',
+  'magicjack', 'textnow', 'pinger', 'bandwith', 'iristel', 'distributel',
+  'voip', 'telecom systems', 'wholesale carrier', 'ymax', 'sipwise',
+];
+
+export async function lookupPhone(input, region, loadData, env = {}, options = {}) {
   const { value, region: hintRegion } = parsePhoneInput(input, region);
 
   let phone;
@@ -76,24 +94,36 @@ export async function lookupPhone(input, region, loadData, env = {}) {
   //    and public POIs. Never individuals.
   //  - Twilio CNAM: the carrier caller-ID database. Metered, and the only
   //    source that can name a subscriber.
-  const [places, filings, footprint, live] = await Promise.all([
-    valid ? openStreetMap(phone).catch((err) => ({ error: err.message })) : null,
-    valid ? secEdgar(phone).catch((err) => ({ error: err.message })) : null,
-    valid && env.BRAVE_SEARCH_API_KEY
+  const isNanp = callingCode === '1' && valid;
+
+  // `offline` turns off every network-backed enrichment, leaving only
+  // libphonenumber and the bundled reference data. The offline unit tests rely
+  // on it: without it they would depend on six third-party services being
+  // reachable, which is neither fast nor a test of this code.
+  const live_ = !options.offline;
+
+  const [places, filings, footprint, live, lerg, encyclopedia] = await Promise.all([
+    live_ && valid ? openStreetMap(phone).catch((err) => ({ error: err.message })) : null,
+    live_ && valid ? secEdgar(phone).catch((err) => ({ error: err.message })) : null,
+    live_ && valid && env.BRAVE_SEARCH_API_KEY
       ? searchFootprint(phone, env.BRAVE_SEARCH_API_KEY).catch((err) => ({ error: err.message }))
       : null,
-    env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
+    live_ && env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN
       ? twilioLookup(phone.format('E.164'), env).catch((err) => ({ error: err.message }))
       : null,
+    live_ && isNanp ? numberingPlan(phone).catch((err) => ({ error: err.message })) : null,
+    live_ && valid ? wikipediaMentions(phone).catch((err) => ({ error: err.message })) : null,
   ]);
 
   const osm = places && !places.error ? places : null;
   const sec = filings && !filings.error ? filings : null;
   const search = footprint && !footprint.error ? footprint : null;
   const cnam = live && !live.error ? live : null;
+  const plan = lerg && !lerg.error ? lerg : null;
+  const wiki = encyclopedia && !encyclopedia.error ? encyclopedia : null;
 
   return {
-    query: { type: 'phone', value, region: hintRegion ?? null },
+    query: { type: 'phone', value, region: hintRegion ?? null, depth: options.depth ?? 'standard' },
     valid,
     possible: phone.isPossible(),
     country: phone.country ?? null,
@@ -111,6 +141,9 @@ export async function lookupPhone(input, region, loadData, env = {}) {
     },
     location: geo ?? null,
     carrier: carrier ?? null,
+    // North American Numbering Plan block data: the rate centre, the switch the
+    // block homes on, and the company the block is allocated to.
+    numberingPlan: plan,
     // Live, metered enrichment. Null unless Twilio credentials are configured.
     identity: cnam,
     identityError: live?.error ?? null,
@@ -120,13 +153,19 @@ export async function lookupPhone(input, region, loadData, env = {}) {
     filings: sec?.matched ? sec : null,
     // Search-engine footprint. Null unless a Brave key is configured.
     search,
+    // Wikipedia articles that print this number.
+    encyclopedia: wiki?.matched ? wiki : null,
     // Every name candidate, ranked and labelled with where it came from.
-    attribution: attribution({ osm, sec, search, cnam }),
+    attribution: attribution({ osm, sec, search, cnam, wiki }),
+    riskProfile: riskProfile(type, plan, cnam, carrier),
     timezones: Array.isArray(timezones) ? timezones : timezones ? [timezones] : [],
     localTime: localTimes(Array.isArray(timezones) ? timezones : []),
-    caveats: caveats(valid, geo, carrier, type, cnam, osm, sec, search),
+    // Every written form of the number, for searching by hand where no API
+    // reaches. Search engines index each of these differently.
+    variants: writtenForms(phone),
+    caveats: caveats(valid, geo, carrier, type, cnam, osm, sec, search, plan),
     example: exampleFor(phone.country),
-    assessment: assess(phone, valid, type, carrier, cnam, osm, sec),
+    assessment: assess(phone, valid, type, carrier, cnam, osm, sec, plan, wiki),
     pivots: pivots(phone.format('E.164')),
     sources: {
       libphonenumber: { ok: true },
@@ -135,8 +174,188 @@ export async function lookupPhone(input, region, loadData, env = {}) {
       ...(filings ? { secEdgar: filings.error ? { ok: false, error: filings.error } : { ok: true } } : {}),
       ...(footprint ? { searchFootprint: footprint.error ? { ok: false, error: footprint.error } : { ok: true } } : {}),
       ...(live ? { twilioLookup: live.error ? { ok: false, error: live.error } : { ok: true } } : {}),
+      ...(lerg ? { numberingPlan: lerg.error ? { ok: false, error: lerg.error } : { ok: true } } : {}),
+      ...(encyclopedia ? { wikipedia: encyclopedia.error ? { ok: false, error: encyclopedia.error } : { ok: true } } : {}),
     },
   };
+}
+
+/* ------------------------------------------------- North American numbering */
+
+/**
+ * NANP block data from the Local Calling Guide.
+ *
+ * This is the single biggest free upgrade available for a US or Canadian
+ * number. The bundled libphonenumber dataset gives a coarse area name and the
+ * carrier a range was allocated to years ago. The LERG — which the Local
+ * Calling Guide republishes as a keyless XML API — gives the *rate centre*, the
+ * physical central-office switch the block homes on (by CLLI code, switch name
+ * and model), the LATA, the operating company number, and the rate centre's
+ * own coordinates.
+ *
+ * For a landline that is a real geographic fix on a telephone exchange, not a
+ * database's guess at a city. It is also the honest way to spot a VoIP number:
+ * the block holder is named outright, and wholesale carriers are unmistakable.
+ */
+async function numberingPlan(phone) {
+  const national = String(phone.nationalNumber);
+  if (national.length !== 10) throw new Error('NANP lookups need a 10-digit national number');
+
+  const npa = national.slice(0, 3);
+  const nxx = national.slice(3, 6);
+
+  const xml = await getText(
+    `https://localcallingguide.com/xmlprefix.php?npa=${npa}&nxx=${nxx}`,
+    { source: 'localcallingguide.com', timeout: 9000 },
+  );
+
+  // The response carries a large DTD before the data; read the fields directly
+  // rather than pulling in an XML parser for eight elements.
+  const field = (name) => {
+    const match = xml.match(new RegExp(`<${name}>([^<]*)</${name}>`, 'i'));
+    const value = match?.[1]?.trim();
+    return value || null;
+  };
+
+  const company = field('company-name');
+  if (!company && !field('rc')) throw new Error(`No LERG record for ${npa}-${nxx}`);
+
+  const latitude = field('rc-lat') ? Number(field('rc-lat')) : null;
+  const longitude = field('rc-lon') ? Number(field('rc-lon')) : null;
+  const wholesale = WHOLESALE_CARRIERS.find((c) => (company ?? '').toLowerCase().includes(c)) ?? null;
+
+  return {
+    npa,
+    nxx,
+    // The rate centre is the billing/geographic unit a landline belongs to —
+    // considerably finer than a city for large metros.
+    rateCentre: field('rc'),
+    region: field('region'),
+    lata: field('lata'),
+    // The CLLI code identifies one physical switch in one building.
+    switchClli: field('switch'),
+    switchName: field('switchname'),
+    switchType: field('switchtype'),
+    ocn: field('ocn'),
+    company,
+    // I = incumbent local exchange carrier, C = competitive, W = wireless.
+    companyType: field('company-type'),
+    incumbentCarrier: field('ilec-name'),
+    // "A" means the whole 10,000-number block; a digit means a pooled
+    // 1,000-number block, which is the modern norm and narrows the holder.
+    blockIdentifier: field('x'),
+    effectiveDate: field('effdate'),
+    updated: field('udate')?.slice(0, 10) ?? null,
+    latitude,
+    longitude,
+    mapUrl: latitude != null && longitude != null
+      ? `https://www.openstreetmap.org/?mlat=${latitude}&mlon=${longitude}#map=13/${latitude}/${longitude}`
+      : null,
+    wholesaleCarrier: wholesale,
+    note: 'Rate-centre and switch data describe where the number block is homed, which is where a landline physically terminates. A mobile or ported number keeps the block\'s identity but not its location.',
+  };
+}
+
+/**
+ * Wikipedia full-text search for the number.
+ *
+ * Narrow but occasionally decisive: an emergency line, a government department,
+ * a broadcaster's phone-in, or a well-known company's switchboard is often
+ * printed in an article, and the article names it unambiguously. Keyless, and
+ * the MediaWiki search API handles quoted phrases properly.
+ */
+async function wikipediaMentions(phone) {
+  const query = `insource:"${phone.formatInternational()}" OR insource:"${phone.formatNational()}"`;
+  const body = await getJson(
+    'https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*'
+      + `&srlimit=5&srsearch=${encodeURIComponent(query)}`,
+    { source: 'en.wikipedia.org', timeout: 9000 },
+  );
+
+  const hits = body.query?.search ?? [];
+  return {
+    matched: hits.length > 0,
+    articles: hits.map((hit) => ({
+      title: hit.title,
+      snippet: (hit.snippet ?? '').replace(/<[^>]+>/g, '').trim() || null,
+      url: `https://en.wikipedia.org/wiki/${encodeURIComponent(hit.title.replace(/ /g, '_'))}`,
+    })),
+  };
+}
+
+/**
+ * What kind of number is this, and how much should a name attached to it be
+ * trusted?
+ *
+ * Type, block holder and caller ID each answer part of the question. Combining
+ * them is what separates "a landline on a Verizon switch in Manhattan" from
+ * "a number bought through an API twenty minutes ago".
+ */
+function riskProfile(type, plan, cnam, carrier) {
+  const signals = [];
+  let level = 'normal';
+
+  if (plan?.wholesaleCarrier) {
+    signals.push({
+      signal: 'Wholesale block holder',
+      detail: `The block is allocated to ${plan.company}, a carrier that sells numbers programmatically. Numbers from these ranges are cheap, instantly provisioned, and are the ones most often used to evade attribution.`,
+    });
+    level = 'elevated';
+  }
+  if (type === 'VOIP') {
+    signals.push({ signal: 'VoIP line type', detail: 'libphonenumber classifies this range as VoIP, which has no fixed physical location by design.' });
+    level = 'elevated';
+  }
+  if (type === 'PREMIUM_RATE') {
+    signals.push({ signal: 'Premium rate', detail: 'Calls are billed at a premium. Callback requests to premium numbers are the wangiri fraud pattern.' });
+    level = 'high';
+  }
+  if (plan?.companyType === 'C') {
+    signals.push({ signal: 'Competitive carrier block', detail: 'The block belongs to a CLEC rather than the incumbent, which is normal but is also the usual route for VoIP resale.' });
+  }
+  if (cnam?.currentCarrier && carrier && cnam.currentCarrier !== carrier) {
+    signals.push({ signal: 'Ported', detail: `The number has moved from ${carrier} to ${cnam.currentCarrier}, so allocation data no longer describes the current operator.` });
+  }
+  if (plan?.companyType === 'I' && type === 'FIXED_LINE') {
+    signals.push({ signal: 'Incumbent landline', detail: `A fixed line on ${plan.incumbentCarrier ?? plan.company}'s own switch. This is the most location-meaningful kind of number there is.` });
+  }
+  if (!signals.length) {
+    signals.push({ signal: 'Nothing unusual', detail: 'Nothing about the line type or block allocation stands out.' });
+  }
+
+  return { level, signals };
+}
+
+/**
+ * Every written form of the number.
+ *
+ * Search engines, forums and leaked datasets each write numbers differently,
+ * and a search for one spelling misses the rest. Listing them is the difference
+ * between "no results" and a result the searcher had to guess their way to.
+ */
+function writtenForms(phone) {
+  const e164 = phone.format('E.164');
+  const national = phone.formatNational();
+  const international = phone.formatInternational();
+  const digits = e164.replace('+', '');
+  const nationalDigits = String(phone.nationalNumber);
+
+  return [...new Set([
+    e164,
+    international,
+    national,
+    phone.format('RFC3966'),
+    digits,
+    nationalDigits,
+    international.replace(/ /g, '-'),
+    international.replace(/ /g, '.'),
+    national.replace(/[()]/g, '').replace(/\s+/g, '-'),
+    national.replace(/[()\s-]/g, ''),
+    `00${digits}`,
+    nationalDigits.length === 10
+      ? `${nationalDigits.slice(0, 3)}.${nationalDigits.slice(3, 6)}.${nationalDigits.slice(6)}`
+      : null,
+  ].filter(Boolean))];
 }
 
 /* --------------------------------------------------------- open-data lookup */
@@ -148,57 +367,171 @@ const OVERPASS_MIRRORS = [
 ];
 
 /**
+ * Tags OSM stores a number under.
+ *
+ * `phone` and `contact:phone` carry the overwhelming majority. The rest are
+ * split out because they are worth checking but must not slow the common case:
+ * a business whose main line is recorded only as a fax or a mobile is invisible
+ * without them, and those are exactly the records nobody else looks at.
+ */
+const OSM_PRIMARY_TAGS = ['phone', 'contact:phone'];
+const OSM_SECONDARY_TAGS = ['contact:mobile', 'phone:mobile', 'fax', 'contact:fax'];
+
+/**
  * Reverse-lookup a phone number against OpenStreetMap.
  *
- * This is a genuinely free, keyless way to put a *name* to a number — the
- * catch is that it only covers businesses and public POIs that someone has
- * mapped, never individuals. When it hits, it is high quality: the operator
- * published the number themselves and the data is open (ODbL).
+ * This is a genuinely free, keyless way to put a *name* to a number — the catch
+ * is that it only covers businesses and public POIs that someone has mapped,
+ * never individuals. When it hits, it is high quality: the operator published
+ * the number themselves and the data is open (ODbL).
  *
- * OSM stores phone numbers as free text with wildly inconsistent punctuation,
- * and a planet-wide regex scan times out. So we generate the plausible
- * spellings from libphonenumber's own formatters and union exact matches,
- * which Overpass can serve off its value index in a couple of seconds.
+ * OSM stores numbers as free text with wildly inconsistent punctuation, and a
+ * planet-wide regex scan times out, so the plausible spellings are generated
+ * from libphonenumber's own formatters and matched exactly off Overpass's value
+ * index. The public instances cost roughly a second per union clause, though,
+ * so the naive query — every spelling against every tag — is a minute of wall
+ * time. The clauses are split into two groups by how likely they are to hit and
+ * run in parallel against different mirrors: the common case answers in the
+ * time one query would take, and the uncommon tags still get checked.
  */
 async function openStreetMap(phone) {
-  const variants = phoneSpellings(phone);
-  const clauses = variants
-    .flatMap((v) => [`nwr["phone"="${v}"];`, `nwr["contact:phone"="${v}"];`])
-    .join('');
-  const query = `[out:json][timeout:20];(${clauses});out center tags;`;
+  const pattern = spellingPattern(phoneSpellings(phone));
+
+  const [first, second] = await Promise.allSettled([
+    overpass(OSM_PRIMARY_TAGS, pattern, OVERPASS_MIRRORS),
+    overpass(OSM_SECONDARY_TAGS, pattern, [...OVERPASS_MIRRORS].reverse()),
+  ]);
+
+  if (first.status === 'rejected' && second.status === 'rejected') {
+    throw first.reason ?? second.reason;
+  }
+
+  const elements = [
+    ...(first.status === 'fulfilled' ? first.value : []),
+    ...(second.status === 'fulfilled' ? second.value : []),
+  ];
+
+  // The two queries can return the same object; identity is type plus id.
+  const seen = new Set();
+  const unique = elements.filter((e) => {
+    const key = `${e.type}/${e.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const places = describePlaces(unique);
+  return { matched: places.length > 0, places, partial: first.status === 'rejected' || second.status === 'rejected' };
+}
+
+/**
+ * One anchored alternation covering every spelling.
+ *
+ * This is the difference between a query that answers and one that times out.
+ * Overpass has no value index for arbitrary tags, so `nwr["phone"="x"]` scans
+ * every object carrying a `phone` tag — and a union of eight such clauses scans
+ * the same data eight times. Folding the spellings into a single value regex
+ * means one scan per key instead of one per spelling.
+ */
+function spellingPattern(spellings) {
+  const escaped = spellings.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return `^(${escaped.join('|')})$`;
+}
+
+/** Run one Overpass union over a set of keys, trying each mirror in turn. */
+async function overpass(keys, valuePattern, mirrors) {
+  if (!keys.length) return [];
+
+  // The pattern is going inside an Overpass QL string literal, which does its
+  // own backslash unescaping before the regex engine ever sees the value. A
+  // regex `\+` written straight into the literal arrives as a bare `+` and the
+  // whole query is rejected as an invalid regular expression, so every
+  // backslash has to survive one extra round of unescaping.
+  const literal = valuePattern.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const clauses = keys.map((key) => `nwr["${key}"~"${literal}"];`).join('');
+  const query = `[out:json][timeout:45];(${clauses});out center tags;`;
 
   let lastError;
-  for (const endpoint of OVERPASS_MIRRORS) {
+  for (const endpoint of mirrors) {
     try {
       const body = await getJson(endpoint, {
         source: new URL(endpoint).hostname,
         method: 'POST',
-        timeout: 8000,
+        // A planet-wide scan on a busy public instance needs real headroom;
+        // a timeout here loses the only free source that names a business.
+        timeout: 18000,
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
         body: `data=${encodeURIComponent(query)}`,
       });
-
-      const places = (body.elements ?? [])
-        .filter((e) => e.tags?.name)
-        .map((e) => ({
-          name: e.tags.name,
-          category: e.tags.amenity ?? e.tags.shop ?? e.tags.office ?? e.tags.tourism ?? e.tags.healthcare ?? null,
-          operator: e.tags.operator ?? null,
-          brand: e.tags.brand ?? null,
-          address: [e.tags['addr:housenumber'], e.tags['addr:street'], e.tags['addr:city'], e.tags['addr:postcode']]
-            .filter(Boolean).join(' ') || null,
-          website: e.tags.website ?? e.tags['contact:website'] ?? null,
-          phone: e.tags.phone ?? e.tags['contact:phone'] ?? null,
-          osmUrl: `https://www.openstreetmap.org/${e.type}/${e.id}`,
-        }))
-        .slice(0, 10);
-
-      return { matched: places.length > 0, places };
+      return body.elements ?? [];
     } catch (err) {
       lastError = err;
+      // 429 means this source address has spent its quota, not that the query
+      // was wrong. Worth saying plainly: on shared egress it is the single most
+      // common reason this panel is empty, and retrying the other mirror with
+      // the same address will usually fail the same way.
+      if (err.status === 429) {
+        lastError = new Error(
+          'Overpass rate-limited this source address (HTTP 429). The public instances meter by IP, '
+          + 'and shared egress — a Worker, a VPN, a datacenter — is frequently exhausted by unrelated traffic.',
+        );
+      }
     }
   }
   throw lastError ?? new Error('No Overpass mirror responded');
+}
+
+/**
+ * Turn Overpass elements into place records.
+ *
+ * The social handles are worth as much as the address: an OSM entry that
+ * carries a Facebook or Instagram account hands you a verified link between a
+ * phone number and a live profile, which is a chain no other free source here
+ * completes.
+ */
+function describePlaces(elements) {
+  const allTags = [...OSM_PRIMARY_TAGS, ...OSM_SECONDARY_TAGS];
+
+  return elements
+    .filter((e) => e.tags?.name)
+    .map((e) => {
+      const t = e.tags;
+      const latitude = e.lat ?? e.center?.lat ?? null;
+      const longitude = e.lon ?? e.center?.lon ?? null;
+
+      const socials = [
+        ['Facebook', t.facebook ?? t['contact:facebook']],
+        ['Instagram', t.instagram ?? t['contact:instagram']],
+        ['X / Twitter', t.twitter ?? t['contact:twitter']],
+        ['LinkedIn', t.linkedin ?? t['contact:linkedin']],
+        ['YouTube', t.youtube ?? t['contact:youtube']],
+      ].filter(([, handle]) => handle).map(([platform, handle]) => ({ platform, handle }));
+
+      return {
+        name: t.name,
+        category: t.amenity ?? t.shop ?? t.office ?? t.tourism ?? t.healthcare ?? t.craft ?? t.leisure ?? null,
+        operator: t.operator ?? null,
+        brand: t.brand ?? null,
+        address: [t['addr:housenumber'], t['addr:street'], t['addr:city'], t['addr:postcode']]
+          .filter(Boolean).join(' ') || null,
+        website: t.website ?? t['contact:website'] ?? null,
+        email: t.email ?? t['contact:email'] ?? null,
+        openingHours: t.opening_hours ?? null,
+        socials,
+        // Which tag matched says whether this is the main line or a fax.
+        matchedTag: allTags.find((tag) => t[tag]) ?? null,
+        phone: t.phone ?? t['contact:phone'] ?? null,
+        // Coordinates make this the only source here that puts a number on a
+        // map with street-level accuracy.
+        latitude,
+        longitude,
+        mapUrl: latitude != null
+          ? `https://www.openstreetmap.org/?mlat=${latitude}&mlon=${longitude}#map=18/${latitude}/${longitude}`
+          : null,
+        osmUrl: `https://www.openstreetmap.org/${e.type}/${e.id}`,
+      };
+    })
+    .slice(0, 10);
 }
 
 /**
@@ -226,6 +559,8 @@ function phoneSpellings(phone) {
     national,
     `${cc} ${national}`,
     national.replace(/[()]/g, '').replace(/\s+/g, '-'),
+    // Written without any separator at all, which is common in bulk imports.
+    `${cc}${String(phone.nationalNumber)}`,
   ])].filter(Boolean);
 }
 
@@ -242,7 +577,7 @@ function phoneSpellings(phone) {
  *   medium  a maintained public dataset lists it against this entity
  *   low     a search engine surfaced it; unverified
  */
-function attribution({ osm, sec, search, cnam }) {
+function attribution({ osm, sec, search, cnam, wiki }) {
   const names = [];
   const add = (value, source, confidence, detail = null) => {
     if (!value) return;
@@ -276,6 +611,15 @@ function attribution({ osm, sec, search, cnam }) {
   for (const place of osm?.places ?? []) {
     add(place.name, 'OpenStreetMap', 'medium',
       [place.category, place.address].filter(Boolean).join(' · ') || null);
+    // The operator tag names the company behind a branded location, which is
+    // often the entity you actually want rather than the shop's trading name.
+    if (place.operator && place.operator !== place.name) {
+      add(place.operator, 'OpenStreetMap operator', 'medium', `Operator of ${place.name}`);
+    }
+  }
+
+  for (const article of wiki?.articles ?? []) {
+    add(article.title, 'Wikipedia', 'medium', 'An article printing this number');
   }
 
   for (const candidate of search?.candidateNames ?? []) {
@@ -294,6 +638,7 @@ function attribution({ osm, sec, search, cnam }) {
     checked: [
       osm ? 'OpenStreetMap' : null,
       sec ? 'SEC EDGAR' : null,
+      wiki ? 'Wikipedia' : null,
       search ? 'Search results' : null,
       cnam ? 'CNAM caller ID' : null,
     ].filter(Boolean),
@@ -536,8 +881,11 @@ function localTimes(zones) {
   });
 }
 
-function caveats(valid, geo, carrier, type, live, osm, sec, search) {
+function caveats(valid, geo, carrier, type, live, osm, sec, search, plan) {
   const notes = [];
+  if (plan) {
+    notes.push('Rate-centre and switch data describe where the *number block* is homed in the numbering plan. For a fixed line that is genuinely where the line terminates; for a mobile or ported number the block identity survives but the location does not.');
+  }
   if (valid) {
     notes.push('Validity means the number matches the published numbering plan for its country. It does not mean the number is currently assigned or in service.');
   }
@@ -574,7 +922,7 @@ function caveats(valid, geo, carrier, type, live, osm, sec, search) {
   return notes;
 }
 
-function assess(phone, valid, type, carrier, live, osm, sec) {
+function assess(phone, valid, type, carrier, live, osm, sec, plan, wiki) {
   const findings = [];
 
   if (!valid) {
@@ -599,6 +947,42 @@ function assess(phone, valid, type, carrier, live, osm, sec) {
   }
   if (carrier) {
     findings.push({ level: 'info', title: `Allocated to ${carrier}`, detail: 'Original range holder. Verify against portability data before relying on this.' });
+  }
+
+  if (plan) {
+    findings.push({
+      level: 'ok',
+      title: `Rate centre: ${plan.rateCentre ?? 'unknown'}${plan.region ? `, ${plan.region}` : ''}`,
+      detail: [
+        plan.switchClli ? `Block homes on switch ${plan.switchClli}${plan.switchName ? ` (${plan.switchName})` : ''}${plan.switchType ? `, a ${plan.switchType}` : ''}` : null,
+        plan.lata ? `LATA ${plan.lata}` : null,
+        plan.company ? `allocated to ${plan.company}${plan.ocn ? ` (OCN ${plan.ocn})` : ''}` : null,
+      ].filter(Boolean).join(' · ')
+        + '. This is LERG data — the numbering plan\'s own record of where the block is homed, which is finer than any city-level estimate.',
+    });
+
+    if (plan.wholesaleCarrier) {
+      findings.push({
+        level: 'warn',
+        title: `Block held by a wholesale carrier (${plan.company})`,
+        detail: 'Carriers like this sell numbers programmatically with no address verification. The number can be minutes old, is not tied to a location, and is the usual source of spoofed and disposable caller IDs.',
+      });
+    } else if (plan.companyType === 'I') {
+      findings.push({
+        level: 'info',
+        title: 'Incumbent carrier block',
+        detail: `${plan.incumbentCarrier ?? plan.company} is the incumbent local exchange carrier for this rate centre, so the block predates the VoIP resale market.`,
+      });
+    }
+  }
+
+  if (wiki?.matched) {
+    findings.push({
+      level: 'ok',
+      title: `Printed in ${wiki.articles.length} Wikipedia article(s)`,
+      detail: wiki.articles.map((a) => a.title).join(', ')
+        + '. A number published in an encyclopedia article belongs to something notable and named.',
+    });
   }
 
   if (osm?.matched) {
@@ -681,13 +1065,25 @@ function explainParseError(code, value, region) {
 function pivots(e164) {
   const bare = e164.replace('+', '');
   const quoted = encodeURIComponent(`"${e164}"`);
+  // One query covering every spelling at once, which is what actually finds a
+  // number that a site wrote differently from the way you typed it.
+  const anyForm = encodeURIComponent(`"${e164}" OR "${bare}"`);
+
   return [
     { label: 'Google', url: `https://www.google.com/search?q=${quoted}` },
+    { label: 'Google (any format)', url: `https://www.google.com/search?q=${anyForm}` },
     { label: 'Bing', url: `https://www.bing.com/search?q=${quoted}` },
     { label: 'DuckDuckGo', url: `https://duckduckgo.com/?q=${quoted}` },
+    { label: 'Yandex', url: `https://yandex.com/search/?text=${quoted}` },
     { label: 'Truecaller', url: `https://www.truecaller.com/search/global/${bare}` },
+    { label: 'Sync.me', url: `https://sync.me/search/?number=${bare}` },
     { label: 'WhatsApp', url: `https://wa.me/${bare}` },
     { label: 'Telegram', url: `https://t.me/+${bare}` },
+    { label: 'Signal', url: `https://signal.me/#p/${e164}` },
+    { label: 'Facebook search', url: `https://www.facebook.com/search/top?q=${quoted}` },
+    { label: 'LinkedIn via Google', url: `https://www.google.com/search?q=${encodeURIComponent(`site:linkedin.com "${e164}"`)}` },
+    { label: 'Documents via Google', url: `https://www.google.com/search?q=${encodeURIComponent(`"${e164}" (filetype:pdf OR filetype:xlsx OR filetype:csv)`)}` },
+    { label: 'Pastes via Google', url: `https://www.google.com/search?q=${encodeURIComponent(`"${e164}" (site:pastebin.com OR site:ghostbin.com OR site:gist.github.com)`)}` },
     { label: 'Have I Been Pwned', url: 'https://haveibeenpwned.com/' },
   ];
 }

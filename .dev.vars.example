@@ -2,14 +2,22 @@
 # All of these are OPTIONAL. GhostTrace is fully functional without any of them —
 # every core source is free and keyless.
 
-# https://account.shodan.io/  -> banner/vuln detail beyond the free InternetDB
+# https://account.shodan.io/  -> service banners, product names and versions per
+# open port, beyond the free InternetDB's port list.
 SHODAN_API_KEY=
 
-# https://www.virustotal.com/gui/my-apikey  -> reputation scoring for domains and IPs
+# https://www.virustotal.com/gui/my-apikey  -> reputation scoring for domains and IPs,
+# including which specific vendors flagged them.
 VIRUSTOTAL_API_KEY=
 
-# https://www.abuseipdb.com/account/api  -> abuse confidence score for IPs
+# https://www.abuseipdb.com/account/api  -> abuse confidence score, usage type, and
+# the report categories that explain what an address was actually reported for.
 ABUSEIPDB_API_KEY=
+
+# https://viz.greynoise.io/account/  -> distinguishes internet-wide background
+# scanning from traffic aimed at you specifically, which is the difference between
+# an alert worth reading and one worth ignoring.
+GREYNOISE_API_KEY=
 
 # https://console.twilio.com/  -> CNAM caller-ID name and post-portability carrier
 # for phone lookups. This is the ONLY source here that can return a subscriber or
@@ -28,3 +36,19 @@ TWILIO_AUTH_TOKEN=
 # API has nothing for phone numbers, and public SearxNG instances serve a
 # captcha. All three were tested.
 BRAVE_SEARCH_API_KEY=
+
+# https://haveibeenpwned.com/API/Key  -> breach exposure for an email address:
+# which breaches, when, and what data class was exposed in each. HIBP is the only
+# authoritative source for this and the key is paid (~$4/month). Without it, the
+# email lookup says nothing about breach exposure rather than guessing.
+HIBP_API_KEY=
+
+# https://github.com/settings/tokens  -> a classic token with NO scopes is enough;
+# this is purely for rate limiting, not access.
+#
+# Worth setting even though nothing depends on it. Unauthenticated GitHub API
+# requests are capped at 60/hour and search at 10/minute PER SOURCE ADDRESS, and
+# on shared egress — a Worker, a VPN, a datacenter — that budget is routinely
+# already spent by unrelated traffic. Without a token, an empty GitHub result in
+# an email or username lookup is not evidence of anything.
+GITHUB_TOKEN=

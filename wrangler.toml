@@ -40,3 +40,14 @@ routes = [
 #   npx wrangler secret put SHODAN_API_KEY
 #   npx wrangler secret put VIRUSTOTAL_API_KEY
 #   npx wrangler secret put ABUSEIPDB_API_KEY
+#   npx wrangler secret put GREYNOISE_API_KEY
+#   npx wrangler secret put TWILIO_ACCOUNT_SID
+#   npx wrangler secret put TWILIO_AUTH_TOKEN
+#   npx wrangler secret put BRAVE_SEARCH_API_KEY
+#   npx wrangler secret put HIBP_API_KEY
+#   npx wrangler secret put GITHUB_TOKEN
+#
+# Note on scan depth: a `depth=deep` lookup makes roughly 100 subrequests, which
+# is over the free plan's 50-per-request ceiling. Deep scans need the Workers
+# Paid plan; on the free plan they degrade to a partial report rather than
+# failing outright. See the README section on free-plan limits.

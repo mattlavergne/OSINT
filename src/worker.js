@@ -38,8 +38,15 @@ const SECURITY_HEADERS = {
   'x-frame-options': 'DENY',
   'referrer-policy': 'strict-origin-when-cross-origin',
   'permissions-policy': 'geolocation=(), microphone=(), camera=()',
+  // `img-src` names the Gravatar avatar hosts and nothing else. An email lookup
+  // that finds a profile should be able to show the face attached to it — that
+  // is often the identifying detail — and the alternative to this one narrow
+  // exception is proxying images through the Worker, which would be a strictly
+  // worse trade: more code, more egress, and the same third party still learns
+  // the hash. Everything else stays same-origin.
   'content-security-policy':
-    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+    "default-src 'self'; script-src 'self'; style-src 'self'; " +
+    "img-src 'self' data: https://*.gravatar.com https://gravatar.com; " +
     "connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'self'",
 };
 
